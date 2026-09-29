@@ -18,6 +18,7 @@ Símbolos: 🟢 concluído · 🟡 em andamento · 🔴 pendente · ⚪ cancelad
 | AP-005 | Planejamento: feriados do `master_config` não bloqueavam geração/registro de aulas | 🟢 | 2026-09-29 |
 | AP-006 | Planejamento: migração de `planejamento_config` para `master_config` e DROP da tabela | 🟢 | 2026-09-29 |
 | AP-007 | Planejamento: frequência ao vivo com diagnóstico, fallback de outra disciplina e exceções manuais | 🟢 | 2026-09-29 |
+| AP-008 | Planejamento: aba Consolidadas (carga × fluxo anual por turma) + Gantt das janelas do fluxo letivo | 🟢 | 2026-09-29 |
 
 ---
 
@@ -241,6 +242,47 @@ alunos; fallback `('309197','2','2026-09-01')` → 22 alunos de outra disciplina
 (8510): banner ✅ 22 no plano 28/09, ⚠️ "Nenhuma frequência" no plano de
 feriado 07/09, ⚠️ "outra disciplina (FUNDAMENTOS DE UI / UX OU IHC) — 22" no
 plano 01/09; comparação "congelada 20 × ao vivo 22"; 0 erros de console.
+
+---
+
+## AP-008 — Planejamento: aba Consolidadas + Gantt do fluxo letivo 🟢
+
+**Pedido:** visão anual das turmas (carga × andamento por disciplina) em uma
+aba própria, com filtro por turma; depois, expor o **fluxo letivo anual**
+(janelas de `restricoes_planejamento`) para colocar cada disciplina em
+perspectiva dentro do seu escopo.
+
+**Solução:**
+- Nova navegação **📈 Consolidadas** (`_SECOES` + `st.radio` logo após o
+  Painel) com `secao_consolidadas()`.
+- `consolidadas_data(turma_filtro)` (`@st.cache_data(ttl=30)`): por
+  turma × disciplina — carga (`subjects.max_hours`, padrão 40), registradas
+  (`historico_aulas`, excluindo `Aula Exclu%`), prontas/pendentes (`.txt` em
+  `aulas/prontas|pendentes`), fila (`planejamento`) e
+  `faltantes = max(0, carga − reg − prontas − pendentes)`; aliases por
+  `_disc_ids()`; base = disciplinas `is_active=1` (fallback p/ inativas).
+- UI: seletor "Todas as turmas" (default), 5 KPIs, `st.progress` de avanço,
+  ⚠️ de excedente, gráfico 1 (fluxo empilhado por disciplina), gráfico 2
+  (carga anual × registradas por turma) e tabela **Detalhamento**.
+- **Gantt "Janela de cada disciplina no ano letivo"** (Altair): barra
+  `inicio → fim` por disciplina, cor por escopo (Anual > 200 dias / Mensal),
+  régua tracejada = hoje, ordenada por início; coluna **Janela** na tabela.
+- `load_janelas_disciplinas()`: lê `master_config['calendario_letivo.json']`
+  (mesma fonte do gerador) com fallback p/ `data/calendario_letivo.json` e
+  indexa `disciplina_id → {inicio, fim, carga}` pelos novos
+  **`disciplina_ids`** de `restricoes_planejamento` (espelhados nas 2 fontes
+  do SysAva; backup `escola_ativa_backup_calendario_20260929_200449.db`).
+
+**Arquivos:** `apps/planejamento_registro/planejamento_registro_streamlit.py`
+(`consolidadas_data`, `load_janelas_disciplinas`, `secao_consolidadas`,
+`_SECOES`), `apps/ISSUES.md`. Dados: `SysAva/data/calendario_letivo.json` +
+`master_config['calendario_letivo.json']` (não versionados).
+
+**Validação:** `py_compile` OK; QA navegador (8510, 0 erros de console):
+Todas → 10 disc / carga 400 / 218 registradas / 25 prontas+pendentes / 158
+faltantes / 54%; filtro I-A → 5 / 200 / 124; Gantt renderiza 10 barras (6
+anuais + 4 mensais) com régua de hoje, 5 barras no filtro I-A; coluna
+Janela na tabela; ⚠️ de excedente de FRONT-END 2026A (alias 33↔6) esperado.
 
 ---
 

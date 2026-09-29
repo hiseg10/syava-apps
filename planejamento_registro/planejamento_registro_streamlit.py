@@ -23,6 +23,7 @@ from datetime import datetime, date
 
 import streamlit as st
 import pandas as pd
+import altair as alt
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -313,6 +314,125 @@ def listar_planejamento(turma_code, disciplina_id):
         (str(turma_code), *ids))]
     conn.close()
     return rows
+
+
+# ===========================================================================
+# Consolidadas (visão anual: carga × fluxo por turma/disciplina)
+# ===========================================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def load_janelas_disciplinas():
+    """`disciplina_id` → janela do fluxo letivo (início/fim/carga).
+
+    Fonte primária: `master_config['calendario_letivo.json']` (a mesma que o
+    gerador usa); fallback: `data/calendario_letivo.json`. Cada restrição em
+    `restricoes_planejamento` traz `disciplina_ids` (espelhado nas 2 fontes).
+    """
+    cal = None
+    try:
+        from tools import database_model
+        cal = database_model.get_config("calendario_letivo.json", PROJECT_ROOT)
+    except Exception:
+        cal = None
+    if not isinstance(cal, dict):
+        try:
+            with open(os.path.join(PROJECT_ROOT, "data", "calendario_letivo.json"),
+                      "r", encoding="utf-8") as fh:
+                cal = json.load(fh)
+        except Exception:
+            return {}
+    idx = {}
+    for chave, v in (cal.get("restricoes_planejamento") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        ini = _data_dt(v.get("data_inicio"))
+        fim = _data_dt(v.get("data_fim"))
+        if not ini or not fim:
+            continue
+        for sid in v.get("disciplina_ids") or []:
+            idx[str(sid)] = {"chave": str(chave), "inicio": ini, "fim": fim,
+                             "carga": v.get("carga_horaria")}
+    return idx
+
+
+def _turma_curta(nome):
+    """Sigla curta da turma (ex.: '2ª SÉRIE - Turma I-A (Técnico DS)' → 'I-A')."""
+    m = re.search(r"Turma\s+([0-9A-Za-z\-]+)", str(nome) or "")
+    return m.group(1) if m else str(nome)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def consolidadas_data(turma_filtro=None):
+    """Consolida, por turma×disciplina: carga anual, registradas (portal),
+    prontas/pendentes (.txt gerados), fila (planejamento) e faltantes.
+
+    `turma_filtro` = code da turma (str) ou None para todas as turmas.
+    """
+    classes = load_classes()
+    janelas = load_janelas_disciplinas()
+    # Índice de arquivos .txt gerados: (pasta, turma_id, disciplina_id) -> qtd
+    txt_idx = {}
+    for pasta in ("prontas", "pendentes"):
+        for it in listar_planos(pasta):
+            k = (pasta, str(it["turma_id"]), str(it["disciplina_id"]))
+            txt_idx[k] = txt_idx.get(k, 0) + 1
+    conn = get_db()
+    linhas = []
+    try:
+        for c in classes:
+            code = str(c["code"])
+            if turma_filtro and code != str(turma_filtro):
+                continue
+            nome = _nome_turma_atual(c["code"])
+            hist = {}
+            for tid, did, n in conn.execute(
+                "SELECT turma_id, disciplina_id, COUNT(*) FROM historico_aulas "
+                "WHERE turma_id = ? AND turma = ? "
+                "AND (status IS NULL OR status NOT LIKE 'Aula Exclu%') "
+                "GROUP BY turma_id, disciplina_id",
+                (code, nome),
+            ):
+                hist[(str(tid), str(did))] = n
+            fila = {}
+            for did, n in conn.execute(
+                "SELECT disciplina_id, COUNT(*) FROM planejamento "
+                "WHERE turma_id = ? AND status IN ('pendente','pronta') "
+                "GROUP BY disciplina_id",
+                (code,),
+            ):
+                fila[str(did)] = n
+            for s in load_subjects_for_class(c["id"]):
+                ids = _disc_ids(c["code"], s["id"])
+                reg = sum(hist.get((code, i), 0) for i in ids)
+                fl = sum(fila.get(i, 0) for i in ids)
+                pr = sum(txt_idx.get(("prontas", code, i), 0) for i in ids)
+                pe = sum(txt_idx.get(("pendentes", code, i), 0) for i in ids)
+                carga = int(s["max_hours"]) if s.get("max_hours") else 40
+                jan = janelas.get(str(s["id"]))
+                if jan is None:
+                    for i in ids:
+                        if i in janelas:
+                            jan = janelas[i]
+                            break
+                linhas.append({
+                    "turma": c["name"],
+                    "turma_code": code,
+                    "turma_curta": _turma_curta(c["name"]),
+                    "disciplina": s["name"],
+                    "disciplina_id": s["id"],
+                    "ativa": str(s.get("is_active")) == "1",
+                    "carga": carga,
+                    "registradas": reg,
+                    "prontas": pr,
+                    "pendentes": pe,
+                    "fila": fl,
+                    "faltantes": max(0, carga - reg - pr - pe),
+                    "janela_inicio": jan["inicio"] if jan else None,
+                    "janela_fim": jan["fim"] if jan else None,
+                    "janela_chave": jan["chave"] if jan else "",
+                })
+    finally:
+        conn.close()
+    return linhas
 
 
 def listar_planos(subdir: str):
@@ -818,6 +938,130 @@ def secao_painel(turma, subject):
             st.dataframe(pd.DataFrame(gaps_t), width="stretch", hide_index=True)
         else:
             st.success("Nenhum buraco.")
+
+
+def secao_consolidadas(turma, subject):
+    st.subheader("📈 Consolidadas — carga anual por turma")
+    st.caption("Carga prevista × andamento do registro de todas as disciplinas. "
+               "Registradas = portal | Prontas/Pendentes = `.txt` gerados | "
+               "Faltantes = carga − (registradas + prontas + pendentes).")
+
+    classes = load_classes()
+    turmas_nome = ["Todas as turmas"] + [f"{c['name']} ({c['code']})" for c in classes]
+    sel = st.selectbox("Turma:", turmas_nome, key="cons_turma")
+    turma_filtro = None if sel == "Todas as turmas" else sel.split("(")[-1].rstrip(")")
+
+    dados = consolidadas_data(turma_filtro)
+    if not dados:
+        st.info("Nenhuma disciplina encontrada.")
+        return
+    ativas = [d for d in dados if d["ativa"]]
+    base = ativas or dados
+
+    tot_carga = sum(d["carga"] for d in base)
+    tot_reg = sum(d["registradas"] for d in base)
+    tot_prontas = sum(d["prontas"] for d in base)
+    tot_pend = sum(d["pendentes"] for d in base)
+    tot_falt = sum(d["faltantes"] for d in base)
+    avanco = round(100 * tot_reg / tot_carga) if tot_carga else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Disciplinas", len(base))
+    m2.metric("Carga anual", f"{tot_carga} aulas")
+    m3.metric("Registradas", tot_reg)
+    m4.metric("Prontas + pendentes", tot_prontas + tot_pend)
+    m5.metric("Faltantes", tot_falt)
+    st.progress(min(100, avanco), text=f"Avanço anual: **{avanco}%** da carga registrada")
+
+    excedentes = [d for d in base if d["registradas"] + d["prontas"] + d["pendentes"] > d["carga"]]
+    if excedentes:
+        st.warning("⚠️ " + ", ".join(f"{d['disciplina']} ({d['turma_curta']})" for d in excedentes)
+                   + " — combinado excede a carga prevista; veja a aba **⚙️ Config**.")
+
+    # Gráfico 0 — janelas do fluxo letivo (Gantt por disciplina)
+    rotulo_turma = sel == "Todas as turmas"
+    jan_rows = []
+    for d in base:
+        if not d.get("janela_inicio") or not d.get("janela_fim"):
+            continue
+        escopo = "Anual" if (d["janela_fim"] - d["janela_inicio"]).days > 200 else "Mensal"
+        jan_rows.append({
+            "Disciplina": (f"{d['disciplina']} ({d['turma_curta']})" if rotulo_turma
+                           else d["disciplina"]),
+            "Inicio": d["janela_inicio"],
+            "Fim": d["janela_fim"],
+            "Escopo": escopo,
+        })
+    if jan_rows:
+        st.markdown("#### 🗓️ Janela de cada disciplina no ano letivo")
+        st.caption("`restricoes_planejamento` do calendário (via `disciplina_ids`); "
+                   "a linha tracejada marca **hoje**.")
+        df_jan = pd.DataFrame(jan_rows).sort_values("Inicio")
+        ordenacao = df_jan["Disciplina"].tolist()
+        barras = alt.Chart(df_jan).mark_bar(cornerRadius=3, size=16).encode(
+            x=alt.X("Inicio:T", title="2026", scale=alt.Scale(
+                domain=[df_jan["Inicio"].min(), df_jan["Fim"].max()])),
+            x2="Fim:T",
+            y=alt.Y("Disciplina:N", sort=ordenacao, title=None,
+                    axis=alt.Axis(labelLimit=260, labelPadding=8)),
+            color=alt.Color("Escopo:N", scale=alt.Scale(
+                domain=["Anual", "Mensal"], range=["#2e7d32", "#1565c0"])),
+            tooltip=[
+                alt.Tooltip("Disciplina:N"),
+                alt.Tooltip("Inicio:T", title="Início", format="%d/%m/%Y"),
+                alt.Tooltip("Fim:T", title="Fim", format="%d/%m/%Y"),
+                alt.Tooltip("Escopo:N"),
+            ],
+        )
+        hoje = alt.Chart(pd.DataFrame({"d": [pd.Timestamp(datetime.now().date())]})) \
+            .mark_rule(color="#d32f2f", strokeDash=[5, 4], size=2).encode(x="d:T")
+        st.altair_chart(barras + hoje, width="stretch", height=420)
+    else:
+        st.info("Nenhuma janela de disciplina encontrada no calendário letivo.")
+
+    # Gráfico 1 — fluxo por disciplina (barras empilhadas)
+    fluxo = []
+    for d in base:
+        disc = f"{d['disciplina']} ({d['turma_curta']})" if rotulo_turma else d["disciplina"]
+        for etapa, qtd in (("Registradas", d["registradas"]), ("Prontas", d["prontas"]),
+                           ("Pendentes", d["pendentes"]), ("Faltantes", d["faltantes"])):
+            fluxo.append({"Disciplina": disc, "Etapa": etapa, "Aulas": qtd})
+    st.markdown("#### 🧭 Fluxo das aulas por disciplina")
+    st.bar_chart(pd.DataFrame(fluxo), x="Disciplina", y="Aulas", color="Etapa",
+                 horizontal=True, stack=True, height=420)
+
+    # Gráfico 2 — carga anual × registradas por turma
+    st.markdown("#### 📚 Carga anual × registradas por turma")
+    por_turma = {}
+    for d in consolidadas_data(None):
+        if not d["ativa"] and ativas:
+            continue
+        t = por_turma.setdefault(d["turma"], {"Carga anual": 0, "Registradas": 0})
+        t["Carga anual"] += d["carga"]
+        t["Registradas"] += d["registradas"]
+    df_turma = pd.DataFrame([
+        {"Turma": k, "Tipo": tipo, "Aulas": v[tipo]}
+        for k, v in por_turma.items() for tipo in ("Carga anual", "Registradas")
+    ])
+    st.bar_chart(df_turma, x="Turma", y="Aulas", color="Tipo", height=320)
+
+    # Tabela consolidada
+    st.markdown("#### 📋 Detalhamento")
+    tab = [{
+        "Turma": d["turma_curta"],
+        "Disciplina": d["disciplina"],
+        "Ativa": "✅" if d["ativa"] else "⬜",
+        "Janela": (f"{d['janela_inicio']:%d/%m} – {d['janela_fim']:%d/%m}"
+                   if d.get("janela_inicio") and d.get("janela_fim") else "—"),
+        "Carga": d["carga"],
+        "Registradas": d["registradas"],
+        "Prontas": d["prontas"],
+        "Pendentes": d["pendentes"],
+        "Fila": d["fila"],
+        "Faltantes": d["faltantes"],
+        "%": f"{round(100 * d['registradas'] / d['carga'])}%" if d["carga"] else "-",
+    } for d in dados]
+    st.dataframe(pd.DataFrame(tab), width="stretch", hide_index=True)
 
 
 def secao_planos(turma, subject):
@@ -1445,6 +1689,7 @@ with st.sidebar:
     st.divider()
     pagina = st.radio("Navegação", [
         "📊 Painel",
+        "📈 Consolidadas",
         "📄 Planos",
         "👁️ Plano Individual",
         "🔍 Reconciliação",
@@ -1464,6 +1709,7 @@ _mostrar_flash()
 
 _SECOES = {
     "📊 Painel": secao_painel,
+    "📈 Consolidadas": secao_consolidadas,
     "📄 Planos": secao_planos,
     "👁️ Plano Individual": secao_individual,
     "🔍 Reconciliação": secao_reconciliacao,
