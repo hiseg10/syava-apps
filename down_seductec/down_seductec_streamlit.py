@@ -44,8 +44,18 @@ st.caption(
 # sobreviver aos reruns do Streamlit.
 RUNTIME = st.session_state.setdefault(
     "down_runtime",
-    {"logs": [], "progress": (0, 1, ""), "stats": None, "running": False, "courses": None},
+    {
+        "logs": [],
+        "progress": (0, 1, ""),
+        "stats": None,
+        "running": False,   # download em andamento
+        "connecting": False,  # navegador abrindo
+        "courses": None,
+    },
 )
+# Sessões antigas podem não ter as chaves novas
+RUNTIME.setdefault("running", False)
+RUNTIME.setdefault("connecting", False)
 
 
 def log(msg: str) -> None:
@@ -92,21 +102,35 @@ with st.sidebar:
     conectado = loader is not None and loader.driver is not None
 
     if not conectado:
-        if st.button("🌐 Conectar ao portal", type="primary", use_container_width=True):
+        if RUNTIME["connecting"]:
+            st.button("⏳ Abrindo o navegador...", disabled=True, use_container_width=True)
+        elif st.button("🌐 Conectar ao portal", type="primary", use_container_width=True):
             loader = get_downloader()
             loader.keep_session = keep
-            RUNTIME["running"] = True
+            RUNTIME["connecting"] = True
+            RUNTIME["running"] = False
             RUNTIME["courses"] = None
             RUNTIME["logs"] = []
             RUNTIME["stats"] = None
+            RUNTIME["progress"] = (0, 1, "")
             log("Abrindo navegador... faça o login (CPF/senha + CAPTCHA).")
-            threading.Thread(target=loader.start_browser, daemon=True).start()
+
+            def _abrir():
+                try:
+                    loader.start_browser()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"Erro ao abrir o navegador: {exc}")
+                finally:
+                    RUNTIME["connecting"] = False
+
+            threading.Thread(target=_abrir, daemon=True).start()
             st.rerun()
     else:
         if st.button("🔌 Desconectar", use_container_width=True):
             get_downloader().stop_browser()
             RUNTIME["running"] = False
             RUNTIME["courses"] = None
+            RUNTIME["stats"] = None
             st.rerun()
 
 
@@ -119,7 +143,7 @@ def _live():
             RUNTIME["courses"] = None
 
     atual, total, rotulo = RUNTIME["progress"]
-    if total > 1:
+    if RUNTIME["running"] and total > 1:
         st.progress(min(atual / total, 1.0), text=f"{atual}/{total} — {rotulo}")
 
     with st.container(height=300):
@@ -147,7 +171,11 @@ if not pronto:
 col_a, col_b = st.columns([2, 1])
 
 with col_a:
-    if st.button("🔄 Listar disciplinas", use_container_width=True):
+    if st.button(
+        "🔄 Listar disciplinas",
+        use_container_width=True,
+        disabled=RUNTIME["running"] or RUNTIME["connecting"],
+    ):
         with st.spinner("Buscando disciplinas no portal..."):
             RUNTIME["courses"] = loader.list_courses()
         if not RUNTIME["courses"]:

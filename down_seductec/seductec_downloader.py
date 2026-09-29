@@ -160,26 +160,31 @@ class SeductecDownloader:
         """
         deadline = time.time() + timeout
         while time.time() < deadline and not self._stop.is_set():
-            try:
-                url = (self.driver.current_url or "").lower()
-                if "login/index.php" not in url:
-                    try:
-                        self.driver.find_elements(By.CLASS_NAME, "coursename")
-                        self.login_ok = True
-                        self._sync_cookies()
-                        self.on_log("Login detectado. Sessão pronta.")
-                        return True
-                    except Exception:  # noqa: BLE001
-                        pass
-            except WebDriverException:
-                pass
+            if self.check_login_now():
+                return True
             time.sleep(interval)
         self.on_log("Tempo esgotado aguardando o login.")
         return False
 
+    def check_login_now(self) -> bool:
+        """Checagem única, não bloqueante (para o fragmento do Streamlit)."""
+        if self.login_ok:
+            return True
+        try:
+            url = (self.driver.current_url or "").lower()
+            if "login/index.php" in url:
+                return False
+            self.driver.find_elements(By.CLASS_NAME, "coursename")
+        except Exception:  # noqa: BLE001
+            return False
+        self.login_ok = True
+        self._sync_cookies()
+        self.on_log("Login detectado. Sessão pronta.")
+        return True
+
     def force_logged_in(self) -> bool:
-        """Botão 'Já fiz login' da UI: tenta concluir agora."""
-        return self.wait_for_login(timeout=1)
+        """Checagem rápida de login usada pela UI a cada segundo."""
+        return self.check_login_now()
 
     def _sync_cookies(self) -> None:
         try:

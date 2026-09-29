@@ -13,6 +13,7 @@ Símbolos: 🟢 concluído · 🟡 em andamento · 🔴 pendente · ⚪ cancelad
 |---|---|---|---|
 | AP-001 | Down SeducTec: app de download de PDFs e links de vídeo (porta 8504) | 🟢 | 2026-09-29 |
 | AP-002 | Criação do repositório syava-apps (repo aninhado em `apps/`, docs e bootloader) | 🟢 | 2026-09-29 |
+| AP-003 | Down SeducTec: botão "Baixar" permanentemente desabilitado após conectar ao portal | 🟢 | 2026-09-29 |
 
 ---
 
@@ -64,6 +65,34 @@ apontando para eles.
 
 **Validação:** `git status` em `apps/` não lista nenhum dado sensível;
 scan por chaves/segredos limpo; menu do `run.bat` atualizado (1-8).
+
+---
+
+## AP-003 — Down SeducTec: botão "Baixar" permanentemente desabilitado após conectar 🟢
+
+**Sintoma:** ao clicar em **Conectar ao portal** e depois listar/selecionar
+disciplinas, o botão **Baixar selecionadas** ficava cinza e a UI mostrava
+"Download em andamento..." mesmo sem download algum.
+
+**Causa:** o clique em *Conectar* usava a mesma flag `RUNTIME["running"]` do
+download e nada a zerava ao terminar de abrir o navegador — o estado
+"baixando" ficava preso para sempre.
+
+**Solução:**
+- Flag separada `RUNTIME["connecting"]` para a abertura do navegador, com
+  `finally` que zera o estado e botão "⏳ Abrindo o navegador..." desabilitado
+  durante a conexão.
+- `force_logged_in()` passou a usar `check_login_now()` (checagem única, não
+  bloqueante) em vez de `wait_for_login(timeout=1)`, eliminando os "Tempo
+  esgotado aguardando o login." repetidos a cada segundo no log.
+- Barra de progresso só aparece com download ativo; *Listar disciplinas* fica
+  desabilitado durante conexão/download.
+
+**Arquivos:** `apps/down_seductec/down_seductec_streamlit.py`,
+`apps/down_seductec/seductec_downloader.py`.
+
+**Validação:** conectar → logar → listar → selecionar disciplinas → botão
+**Baixar selecionadas** ativo; "Download em andamento..." só durante o job real.
 
 ---
 
