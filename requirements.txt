@@ -1,0 +1,9 @@
+streamlit
+pandas
+supabase
+python-dotenv
+requests
+selenium
+webdriver-manager
+streamlit-javascript
+streamlit-pdf-viewer

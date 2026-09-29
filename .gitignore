@@ -1,0 +1,32 @@
+# Repositório ignorado fora do escopo (versiona só os apps Streamlit)
+api/
+apis_gemini_key/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Dados, backups e saídas geradas (nunca versionar)
+*.db
+*.sqlite
+*.log
+*.csv
+logs/
+html/
+*.png
+*.pdf
+
+# Sessão/credenciais locais
+.chrome_profile/
+.env
+*.pem
+*.key
+
+# Ambiente virtual e caches de ferramentas
+.venv/
+venv/
+.ipynb_checkpoints/
+.streamlit/secrets.toml
