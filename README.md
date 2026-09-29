@@ -38,6 +38,16 @@ apps\run_apps.bat
 | `down_seductec/` | 8504 | Baixa PDFs e links de vídeo do portal SeducTec para `data/repo/<turma>/<disciplina>/S0X/seductec/` |
 | `analise_notas/` | — | Scripts/notebook de análise de notas (gera dashboard HTML local) |
 
+### Notebooks das aulas baixadas
+
+O script standalone `down_seductec/gerar_notebooks.py` gera (ou regera, a cada
+download) um `aulas_S0X.ipynb` dentro de cada pasta `S0X/seductec/`, com índice
+navegável, links das Leituras (PDFs locais) e o player do YouTube embutido:
+
+```bat
+.sysenv\Scripts\python.exe apps\down_seductec\gerar_notebooks.py
+```
+
 ## Estrutura fora do escopo (não versionado)
 
 `apps/api/` (API FastAPI + plugins), `apps/apis_gemini_key/`, `apps/data/`

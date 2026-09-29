@@ -14,6 +14,7 @@ Símbolos: 🟢 concluído · 🟡 em andamento · 🔴 pendente · ⚪ cancelad
 | AP-001 | Down SeducTec: app de download de PDFs e links de vídeo (porta 8504) | 🟢 | 2026-09-29 |
 | AP-002 | Criação do repositório syava-apps (repo aninhado em `apps/`, docs e bootloader) | 🟢 | 2026-09-29 |
 | AP-003 | Down SeducTec: botão "Baixar" permanentemente desabilitado após conectar ao portal | 🟢 | 2026-09-29 |
+| AP-004 | Gerador de notebooks `aulas_S0X.ipynb` para as pastas baixadas | 🟢 | 2026-09-29 |
 
 ---
 
@@ -96,6 +97,37 @@ download e nada a zerava ao terminar de abrir o navegador — o estado
 
 ---
 
+## AP-004 — Gerador de notebooks `aulas_S0X.ipynb` 🟢
+
+**Pedido:** gerar um notebook por semana dentro das pastas baixadas pelo Down
+SeducTec, com índice navegável e player do YouTube reproduzido no layout
+`S0X — AULA NN` + links de Leitura (PDFs).
+
+**Solução:** script standalone `apps/down_seductec/gerar_notebooks.py`:
+- Varre `data/repo/<turma>/<disciplina>/S0X/seductec/` (filtros opcionais
+  `--turma`, `--disciplina`, `--semanas`) onde houver `links_aulas.md`.
+- Reusa `SeductecDownloader._parse_links_md` (parser único de vídeos) e cruza
+  com os PDFs `Aula_NN_Parte_*.pdf` locais por aula.
+- Gera `aulas_S0X.ipynb` (nbformat v4, `validate()` em cada arquivo):
+  célula de índice com âncoras + cartão por aula (PDFs como "📄 Leitura Aula
+  NN") + célula de código com `IFrame` do `youtube.com/embed/<id>` e **output
+  já embutido** (abre sem rodar nada).
+- Assina com `NotebookNotary` (melhor esforço) para o HTML renderizar sem
+  "Trust".
+
+**Uso:** `.sysenv\Scripts\python.exe apps\down_seductec\gerar_notebooks.py`
+(idempotente — sobrescreve os notebooks).
+
+**Arquivos:** `apps/down_seductec/gerar_notebooks.py`, `apps/ISSUES.md`.
+
+**Validação:** 6 notebooks gerados (S01–S06 de DISPOSITIVOS MÓVEIS; as pastas
+POO sob `repo/Turmas/` não têm `links_aulas.md` e ficam de fora); cada um com
+`nbformat.validate` OK, 9 células markdown + 8 código, 8 iframes com 8 IDs
+YouTube únicos, 8 links de PDF e `check_signature()=True`; prévia HTML
+renderizada com os players carregando (0 erros de console).
+
+---
+
 ## Comandos úteis
 
 ```bat
@@ -104,4 +136,8 @@ apps\run_apps.bat
 
 :: Subir só o Down SeducTec
 .sysenv\Scripts\streamlit.exe run apps/down_seductec/down_seductec_streamlit.py --server.port 8504
+
+:: Gerar/regaer os notebooks aulas_S0X.ipynb nas pastas baixadas
+.sysenv\Scripts\python.exe apps\down_seductec\gerar_notebooks.py
+.sysenv\Scripts\python.exe apps\down_seductec\gerar_notebooks.py --semanas S06 --disciplina "PROGRAMAÇÃO PARA DISPOSITIVOS MÓVEIS"
 ```
