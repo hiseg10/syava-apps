@@ -469,10 +469,9 @@ def gerar_txt_planos(
     # 9b. Carregar data de corte do planejamento
     data_corte = None
     try:
-        cursor.execute("SELECT valor FROM planejamento_config WHERE chave = 'data_corte_planejamento'")
-        corte_row = cursor.fetchone()
-        if corte_row and corte_row['valor']:
-            data_corte = datetime.strptime(corte_row['valor'], "%Y-%m-%d").date()
+        corte_valor = database_model.get_config('data_corte_planejamento', PROJECT_ROOT)
+        if corte_valor:
+            data_corte = datetime.strptime(str(corte_valor)[:10], "%Y-%m-%d").date()
     except:
         pass
 
@@ -671,7 +670,7 @@ def gerar_txt_planos(
 
     # --- Geração dos planos ---
     novos_planos = []
-    debug_counters = {"turmas_iteradas": 0, "dias_iterados": 0, "slots_processados": 0, "slots_gerados": 0, "slots_pulados": [], "sem_licao": 0}
+    debug_counters = {"turmas_iteradas": 0, "dias_iterados": 0, "slots_processados": 0, "slots_gerados": 0, "slots_pulados": [], "sem_licao": 0, "freq_outra_disciplina": []}
 
     # Ordenar grade por dia da semana e horário
     grade_ordenada = sorted(grade_raw, key=lambda x: (
@@ -735,6 +734,13 @@ def gerar_txt_planos(
 
             # Pula datas anteriores ao ponto de corte
             if data_corte and curr_date < data_corte:
+                curr_date += timedelta(days=1)
+                continue
+
+            # Pula feriados, ferias/recessos, planejamento e exames
+            # (feriados_data vem do master_config -> feriados.json)
+            if data_iso in feriados_data:
+                debug_counters["slots_pulados"].append(f"Feriado/recesso: {data_iso}")
                 curr_date += timedelta(days=1)
                 continue
 
@@ -982,6 +988,7 @@ def gerar_txt_planos(
     skipped_files = []
     deleted_old = []
     planos_com_frequencia = 0
+    planos_freq_outra_disciplina = 0
     planos_atualizados_db = 0
 
     # Limpar arquivos anteriores ao corte (se force_overwrite)
@@ -1076,14 +1083,17 @@ def gerar_txt_planos(
         lines.append("")
 
         freq_linhas = []
+        att_source = None
+        att_diag = {}
         lines.append(f"[FREQUENCIA]")
         lines.append(f"### Lista de Presença")
         if students:
             # Busca frequencia REAL pela DATA EXATA da aula.
-            # Prioridade: corrigido -> normalizado -> student_attendance.json -> planejado.
+            # Prioridade: exceções manuais -> tabela attendance (com fallback de
+            # outra disciplina) -> corrigido -> normalizado -> raw -> planejado.
             turma_code = str(p['turma_id'])
             disc_id = str(p['disciplina_id'])
-            attendance_map, att_source = banco.load_attendance_map_for(turma_code, disc_id, p['data'])
+            attendance_map, att_source, att_diag = banco.load_attendance_map_for(turma_code, disc_id, p['data'])
 
             for student in students:
                 name = student.get('student_name', '')
@@ -1127,6 +1137,10 @@ def gerar_txt_planos(
         generated_files.append(fname)
         if att_source:
             planos_com_frequencia += 1
+        if att_diag.get("outra_disciplina"):
+            planos_freq_outra_disciplina += 1
+            debug_counters["freq_outra_disciplina"].append(
+                f"{fname}: {att_source}")
 
         # Salvar/atualizar no banco (planejamento) - upsert: nunca duplica slot
         try:
@@ -1223,6 +1237,7 @@ def gerar_txt_planos(
         "skipped": len(skipped_files),
         "deleted_old": len(deleted_old),
         "com_frequencia": planos_com_frequencia,
+        "freq_outra_disciplina": planos_freq_outra_disciplina,
         "updated_db": planos_atualizados_db,
         "sem_licao": debug_counters["sem_licao"],
         "path": f"aulas/{output_dir}/",

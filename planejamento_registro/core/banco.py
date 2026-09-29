@@ -49,28 +49,51 @@ get_db_connection = get_db
 
 
 # ---------------------------------------------------------------------------
-# Configuração (tabela planejamento_config)
+# Configuração (tabela master_config; antes planejamento_config)
 # ---------------------------------------------------------------------------
-def get_config(chave, default=None):
-    conn = get_db()
+def _database_model():
     try:
-        row = conn.execute(
-            "SELECT valor FROM planejamento_config WHERE chave = ?", (chave,)
-        ).fetchone()
-        return row[0] if row else default
-    finally:
-        conn.close()
+        from tools import database_model
+    except ImportError:
+        import database_model
+    return database_model
+
+
+def get_config(chave, default=None):
+    """Lê uma configuração da tabela ``master_config`` (valor em JSON)."""
+    try:
+        val = _database_model().get_config(chave, PROJECT_ROOT)
+    except Exception:
+        val = None
+    return default if val is None else val
 
 
 def set_config(chave, valor):
+    """Grava uma configuração na tabela ``master_config`` (valor em JSON)."""
+    _database_model().set_config(chave, valor, PROJECT_ROOT)
+
+
+def listar_parametros():
+    """Chaves de parâmetros da ``master_config`` (ignora os ``.json`` grandes)."""
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO planejamento_config (chave, valor) VALUES (?, ?) "
-            "ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor",
-            (chave, str(valor)),
-        )
-        conn.commit()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(master_config)")]
+        if 'key' in cols:
+            rows = conn.execute(
+                "SELECT key, value, updated_at FROM master_config ORDER BY key"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT chave, valor, NULL FROM master_config ORDER BY chave"
+            ).fetchall()
+        out = []
+        for r in rows:
+            if str(r[0]).endswith(".json"):
+                continue
+            out.append({"chave": r[0], "valor": r[1], "atualizado": r[2] or ""})
+        return out
+    except Exception:
+        return []
     finally:
         conn.close()
 
@@ -158,7 +181,7 @@ def load_attendance_json(att_name):
     return data
 
 
-def load_attendance_from_db(turma_id, data_iso, disc_id=None):
+def load_attendance_from_db(turma_id, data_iso, disc_id=None, permitir_outra=True):
     """Lê a frequência real da tabela `attendance` do banco local (data exata).
 
     Resolução estruturada como: DATA -> TURMA -> DISCIPLINA.
@@ -167,8 +190,11 @@ def load_attendance_from_db(turma_id, data_iso, disc_id=None):
       3. Filtra pela disciplina (`subject_id`) quando há registros com a
          disciplina preenchida. Linhas legadas (subject_id NULL) são usadas
          apenas como fallback, pois não é possível atribuí-las a uma matéria.
+      4. Fallback opcional: se a turma tem frequência na data porém gravada sob
+         OUTRA disciplina, usa o mapa maior e sinaliza em ``extra``.
 
-    Retorna (mapa {NOME: status}, origem) ou (None, None).
+    Retorna ``(mapa, origem, extra)``; ``extra`` pode conter
+    ``outra_disciplina``, ``disciplina`` e ``disciplina_nome``.
     """
     try:
         conn = get_db()
@@ -180,18 +206,18 @@ def load_attendance_from_db(turma_id, data_iso, disc_id=None):
                     norm_classes.append(n)
         if not norm_classes:
             conn.close()
-            return None, None
+            return None, None, {}
         rows = conn.execute(
             "SELECT student_name, is_present, class_name, subject_id FROM attendance WHERE date = ?",
             (data_iso,),
         ).fetchall()
-        conn.close()
     except Exception:
-        return None, None
+        return None, None, {}
 
     disc = str(disc_id) if disc_id is not None else None
     mapa_exata = {}
     mapa_legado = {}
+    por_disciplina = {}
     for r in rows:
         cnc = _norm_key(r["class_name"])
         if not cnc:
@@ -206,11 +232,30 @@ def load_attendance_from_db(turma_id, data_iso, disc_id=None):
             mapa_legado[key] = status
         elif str(sid) == disc:
             mapa_exata[key] = status
+        else:
+            por_disciplina.setdefault(str(sid), {})[key] = status
+
     if mapa_exata:
-        return mapa_exata, "tabela attendance (disciplina)"
+        return mapa_exata, "tabela attendance (disciplina)", {}
     if mapa_legado:
-        return mapa_legado, "tabela attendance (legado, sem disciplina)"
-    return None, None
+        return mapa_legado, "tabela attendance (legado, sem disciplina)", {}
+    if permitir_outra and por_disciplina:
+        sid2, mapa2 = max(por_disciplina.items(), key=lambda kv: len(kv[1]))
+        nome2 = None
+        try:
+            conn2 = get_db()
+            r2 = conn2.execute("SELECT name FROM subjects WHERE id = ?", (sid2,)).fetchone()
+            conn2.close()
+            nome2 = r2["name"] if r2 else None
+        except Exception:
+            nome2 = None
+        rotulo = nome2 or sid2
+        return mapa2, f"tabela attendance (outra disciplina: {rotulo})", {
+            "outra_disciplina": True,
+            "disciplina": sid2,
+            "disciplina_nome": nome2,
+        }
+    return None, None, {}
 
 
 def attendance_turma_keys(turma_id):
@@ -230,12 +275,61 @@ def attendance_turma_keys(turma_id):
     return keys
 
 
+def _attendance_exceptions():
+    """Carrega (com cache) `attendance_exceptions.json` da pasta de plugins."""
+    cache_key = "attendance_exceptions.json"
+    if cache_key in _attendance_cache:
+        return _attendance_cache[cache_key]
+    data = {}
+    for folder in ATTENDANCE_JSON_LOCATIONS:
+        path = os.path.join(folder, cache_key)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+            break
+    _attendance_cache[cache_key] = data
+    return data
+
+
+def _attendance_exception(turma_id, data_iso, disc_id):
+    """Exceção manual para a aula.
+
+    Chaves aceitas em `attendance_exceptions.json`:
+      - ``"{turma}|{data}|{disc}"`` (específica) ou ``"{turma}|{data}"`` (dia).
+    Valores: ``{"acao": "ignorar", "nota": "..."}`` ou
+    ``{"acao": "usar_disciplina", "disciplina": "2", "nota": "..."}``.
+    """
+    exc = _attendance_exceptions()
+    if not exc:
+        return None, None
+    for tk in attendance_turma_keys(turma_id):
+        chave_disc = f"{tk}|{data_iso}|{disc_id}" if disc_id is not None else None
+        chave_dia = f"{tk}|{data_iso}"
+        if chave_disc and chave_disc in exc:
+            return exc[chave_disc], chave_disc
+        if chave_dia in exc:
+            return exc[chave_dia], chave_dia
+    return None, None
+
+
 def load_attendance_map_for(turma_id, disc_id, data_iso):
     """Mapa de presença {RA/nome: status} de uma aula específica.
 
+    Retorna ``(mapa, fonte, diagnostico)``:
+
+    - ``diagnostico``: ``encontrou``, ``quantidade``, ``fontes`` (consultadas),
+      ``outra_disciplina`` (fallback de outra disciplina), ``disciplina`` e
+      ``excecao`` (se houver exceção manual).
+
     Prioridade das fontes:
-      1. Tabela `attendance` do banco local (frequência sincronizada do
-         Supabase), resolvida na ordem DATA -> TURMA -> DISCIPLINA.
+      0. `attendance_exceptions.json` (ignorar / usar_disciplina);
+      1. Tabela `attendance` do banco local (DATA -> TURMA -> DISCIPLINA, com
+         fallback para outra disciplina da mesma turma/data);
       2. JSONs do plugin (data/repo/plugins → api/plugins), na ordem
          corrigido → normalizado → raw → planejado.
 
@@ -244,16 +338,48 @@ def load_attendance_map_for(turma_id, disc_id, data_iso):
       - canônico    {turma: {disciplina: {data: {ra: status}}}};
       - data-first  {data: {turma: {disciplina: {ra: status}}}}.
     """
+    diag = {
+        "encontrou": False,
+        "quantidade": 0,
+        "fontes": [],
+        "outra_disciplina": False,
+        "disciplina": str(disc_id) if disc_id is not None else None,
+        "excecao": None,
+        "chave_excecao": None,
+    }
+
+    def _achou(entry, fonte, outra=False):
+        diag["encontrou"] = True
+        diag["quantidade"] = len(entry)
+        diag["outra_disciplina"] = bool(outra)
+        return entry, fonte, diag
+
+    # 0) Exceções manuais
+    exc, chave_exc = _attendance_exception(turma_id, data_iso, disc_id)
+    if exc:
+        diag["excecao"] = str(exc.get("nota") or exc.get("acao") or "")
+        diag["chave_excecao"] = chave_exc
+        acao = str(exc.get("acao") or "").lower()
+        if acao == "ignorar":
+            diag["fontes"].append(f"attendance_exceptions.json (ignorar: {chave_exc})")
+            return {}, "exceção manual (ignorar)", diag
+        if acao == "usar_disciplina" and exc.get("disciplina") is not None:
+            disc_id = str(exc["disciplina"])
+            diag["disciplina"] = disc_id
+            diag["fontes"].append(f"attendance_exceptions.json (→ disciplina {disc_id})")
+
     # 1) Tabela attendance (banco local) — data -> turma -> disciplina
-    db_map, db_src = load_attendance_from_db(turma_id, data_iso, disc_id)
+    diag["fontes"].append("tabela attendance")
+    db_map, db_src, db_extra = load_attendance_from_db(turma_id, data_iso, disc_id)
     if db_map:
-        return db_map, db_src
+        return _achou(db_map, db_src, outra=bool(db_extra.get("outra_disciplina")))
 
     # 2) JSONs do plugin
     for att_name in ATTENDANCE_FILES_PRIORITY:
         att_data = load_attendance_json(att_name)
         if not att_data:
             continue
+        diag["fontes"].append(att_name)
         primeira_chave_top = str(next(iter(att_data.keys()), ""))
 
         # Formato data-first {data: {turma: {disciplina: {ra: status}}}}
@@ -267,10 +393,12 @@ def load_attendance_map_for(turma_id, disc_id, data_iso):
                     continue
                 entry = bloco_turma.get(str(disc_id))
                 if isinstance(entry, dict) and entry:
-                    return entry, f"{att_name} (data -> turma -> disciplina)"
+                    return _achou(entry, f"{att_name} (data -> turma -> disciplina)")
                 for dk, dias in bloco_turma.items():
                     if isinstance(dias, dict) and dias:
-                        return dias, f"{att_name} (data -> turma, disc {dk})"
+                        outra = disc_id is not None and str(dk) != str(disc_id)
+                        return _achou(dias, f"{att_name} (data -> turma, disc {dk})",
+                                      outra=outra)
             continue
 
         # Formato turma-first: plano ou canônico
@@ -283,19 +411,20 @@ def load_attendance_map_for(turma_id, disc_id, data_iso):
             if re.match(r"\d{4}-\d{2}-\d{2}$", primeira_chave):
                 entry = bloco_turma.get(data_iso)
                 if isinstance(entry, dict) and entry:
-                    return entry, att_name
+                    return _achou(entry, att_name)
                 continue
             # Formato aninhado: 1) disciplina exata
             bloco_disc = bloco_turma.get(str(disc_id))
             if isinstance(bloco_disc, dict):
                 entry = bloco_disc.get(data_iso)
                 if isinstance(entry, dict) and entry:
-                    return entry, att_name
+                    return _achou(entry, att_name)
             # 2) fallback: qualquer disciplina dessa turma com essa data
             for dk, dias in bloco_turma.items():
                 if not isinstance(dias, dict):
                     continue
                 entry = dias.get(data_iso)
                 if isinstance(entry, dict) and entry:
-                    return entry, f"{att_name} (disc {dk})"
-    return {}, None
+                    outra = disc_id is not None and str(dk) != str(disc_id)
+                    return _achou(entry, f"{att_name} (disc {dk})", outra=outra)
+    return {}, None, diag

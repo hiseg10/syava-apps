@@ -27,7 +27,7 @@ def parse_data(s):
 
 
 def data_corte(default=None):
-    """Data de corte configurada em ``planejamento_config``."""
+    """Data de corte configurada em ``master_config`` (``data_corte_planejamento``)."""
     try:
         valor = get_config("data_corte_planejamento")
         if valor:

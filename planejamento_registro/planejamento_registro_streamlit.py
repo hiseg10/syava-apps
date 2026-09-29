@@ -98,7 +98,7 @@ def gerar_planos(turma_code, disciplina_id, output_dir="pendentes", force=False,
 
 
 # ===========================================================================
-# Tipos de estratégia (lista configurável, persistida em planejamento_config)
+# Tipos de estratégia (lista configurável, persistida em master_config)
 # ===========================================================================
 _ESTRATEGIAS_DEFAULT = [
     "Aula expositiva",
@@ -109,9 +109,11 @@ _ESTRATEGIAS_DEFAULT = [
 
 def _estrategias_disponiveis():
     raw = core_banco.get_config("estrategias_disponiveis")
+    if isinstance(raw, list) and raw:
+        return [str(x).strip() for x in raw if str(x).strip()]
     if raw:
         try:
-            lista = json.loads(raw)
+            lista = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(lista, list) and lista:
                 return [str(x).strip() for x in lista if str(x).strip()]
         except Exception:
@@ -120,7 +122,7 @@ def _estrategias_disponiveis():
 
 
 def _salvar_estrategias(lista):
-    core_banco.set_config("estrategias_disponiveis", json.dumps(lista, ensure_ascii=False))
+    core_banco.set_config("estrategias_disponiveis", list(lista))
 
 
 def _python() -> str:
@@ -418,6 +420,51 @@ def load_blacklist():
         return {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _feriados_config():
+    """Calendário de feriados do `master_config` (chave `feriados.json`).
+
+    Mesma fonte usada pelo gerador (`core/gerador.py`).
+    """
+    try:
+        from tools import database_model
+        return database_model.get_config("feriados.json", PROJECT_ROOT) or {}
+    except Exception:
+        return {}
+
+
+def feriado_na_data(data_iso):
+    """Descrição do feriado/recesso/exame para a data, ou '' se for dia letivo.
+
+    Aceita `yyyy-mm-dd`, `dd/mm/aaaa` etc. (via `core_datas.parse_data`).
+    Cobre as mesmas categorias do gerador: feriados, férias/recessos,
+    planejamento/formação e exames.
+    """
+    d = core_datas.parse_data(data_iso)
+    if not d:
+        return ""
+    iso = d.isoformat()
+    cfg = _feriados_config() or {}
+    for cat in ("feriados_e_datas_importantes", "ferias_e_recessos",
+                "planejamento_e_formacao", "exames"):
+        for item in cfg.get(cat, []) or []:
+            if not isinstance(item, dict):
+                continue
+            desc = str(item.get("descricao") or "Feriado/recesso")
+            if item.get("data") and str(item["data"]) == iso:
+                return desc
+            inicio, fim = item.get("inicio"), item.get("fim")
+            if inicio and fim:
+                try:
+                    di = datetime.strptime(str(inicio)[:10], "%Y-%m-%d").date()
+                    df = datetime.strptime(str(fim)[:10], "%Y-%m-%d").date()
+                    if di <= d <= df:
+                        return desc
+                except Exception:
+                    continue
+    return ""
+
+
 def parse_plano_txt(conteudo: str):
     meta = {}
     for chave in ("TURMA_ID", "DISCIPLINA_ID", "DATA", "HORARIO", "AULA_NUM", "DISCIPLINA_NOME"):
@@ -520,7 +567,7 @@ def montar_conteudo_plano(turma, subject, data_iso, horario, n_aula, project_roo
     nome_mae = nome_mae or subject["name"]
     lesson = database_model.get_lesson_content_by_number(subject["id"], n_aula, project_root) or {}
     students = database_model.get_students_by_class_id(turma["code"], project_root)
-    attendance_map, _src = core_banco.load_attendance_map_for(
+    attendance_map, _src, _diag = core_banco.load_attendance_map_for(
         str(turma["code"]), id_mae, data_iso
     )
     txt = build_plan_txt(
@@ -745,7 +792,12 @@ def secao_painel(turma, subject):
         with st.expander("🗓️ Fila de planejamento"):
             plan = listar_planejamento(turma["code"], subject["id"])
             if plan:
+                for r in plan:
+                    r["Feriado"] = feriado_na_data(r.get("data_planejada", "")) or ""
                 st.dataframe(pd.DataFrame(plan), width="stretch", hide_index=True)
+                n_fer = sum(1 for r in plan if r["Feriado"])
+                if n_fer:
+                    st.warning(f"⚠️ {n_fer} plano(s) na fila com data de feriado/recesso — registro bloqueado.")
             else:
                 st.caption("Nada planejado ainda.")
 
@@ -789,6 +841,10 @@ def secao_planos(turma, subject):
     if planos:
         opcoes = {p["arquivo"]: p for p in planos}
         escolhido = st.selectbox("Visualizar plano:", list(opcoes.keys()), key="planos_sel")
+        desc_fer = feriado_na_data(opcoes[escolhido].get("data", ""))
+        if desc_fer:
+            st.warning(f"⚠️ **Feriado/recesso**: `{opcoes[escolhido].get('data')}` — {desc_fer}. "
+                       "O registro no portal está bloqueado para esta data.")
         conteudo = ler_plano_local(pasta, opcoes[escolhido]["arquivo"])
         st.text_area("Conteúdo", conteudo, height=320)
 
@@ -898,6 +954,11 @@ def secao_planos(turma, subject):
                     aula_max=(int(aula_max) if ativar_range and aula_max > 0 else None),
                 )
                 st.success(f"✅ {data.get('generated', 0)} plano(s) em `{data.get('path', out_dir)}`.")
+                st.caption(
+                    f"Frequência: {data.get('com_frequencia', 0)} plano(s) com lista"
+                    + (f" • {data.get('freq_outra_disciplina', 0)} vindo de OUTRA disciplina"
+                       if data.get('freq_outra_disciplina') else "")
+                )
                 st.json(data.get("debug", {}))
                 st.cache_data.clear()
             except Exception as e:
@@ -939,12 +1000,51 @@ def secao_individual(turma, subject):
     conteudo = ler_plano_local(pasta, sel)
     meta, freq = parse_plano_txt(conteudo)
 
+    desc_fer = feriado_na_data(opcoes[sel].get("data", "") or meta.get("DATA", ""))
+    if desc_fer:
+        st.warning(f"⚠️ **Feriado/recesso**: `{opcoes[sel].get('data')}` — {desc_fer}. "
+                   "Registro no portal bloqueado para esta data.")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Data", meta.get("DATA", "-"))
     c2.metric("Horário", meta.get("HORARIO", "-"))
     c3.metric("Aula", meta.get("AULA_NUM", "-"))
     c4.metric("Disciplina", meta.get("DISCIPLINA_NOME", "-")[:26])
     st.caption(f"TURMA_ID {meta.get('TURMA_ID', '-')} • DISCIPLINA_ID {meta.get('DISCIPLINA_ID', '-')} • `{sel}`")
+
+    # Frequência ao vivo (banco) x plano congelado (.txt)
+    st.markdown("#### 🔎 Frequência ao vivo (banco)")
+    try:
+        _p_info = opcoes[sel]
+        mapa_vivo, fonte_vivo, diag_vivo = core_banco.load_attendance_map_for(
+            str(_p_info.get("turma_id") or meta.get("TURMA_ID")),
+            str(_p_info.get("disciplina_id") or meta.get("DISCIPLINA_ID")),
+            str(_p_info.get("data") or meta.get("DATA")),
+        )
+    except Exception as e:
+        mapa_vivo, fonte_vivo = {}, None
+        diag_vivo = {"encontrou": False, "quantidade": 0, "fontes": [], "erro": str(e)}
+    if diag_vivo.get("excecao"):
+        st.info(f"ℹ️ Exceção manual: {diag_vivo['excecao']}")
+    if diag_vivo.get("encontrou"):
+        if diag_vivo.get("outra_disciplina"):
+            st.warning(f"⚠️ Frequência de **outra disciplina** — {fonte_vivo} — "
+                       f"{diag_vivo['quantidade']} aluno(s). Conferir antes de registrar.")
+        else:
+            st.success(f"✅ Frequência encontrada ({diag_vivo['quantidade']} aluno(s)) — "
+                       f"fonte: {fonte_vivo}.")
+        with st.expander(f"📋 Frequência ao vivo — {diag_vivo['quantidade']} aluno(s)"):
+            linhas_vivo = [{"Aluno": k, "Status": v} for k, v in sorted(mapa_vivo.items())]
+            st.dataframe(pd.DataFrame(linhas_vivo), width="stretch", hide_index=True, height=260)
+        if freq:
+            st.caption(f"Frequência congelada no .txt: {len(freq)} aluno(s) • "
+                       f"ao vivo: {diag_vivo['quantidade']}.")
+    else:
+        consultadas = ", ".join(diag_vivo.get("fontes") or []) or \
+            "tabela attendance + JSONs do plugin"
+        st.warning(f"⚠️ Nenhuma frequência encontrada para esta aula. "
+                   f"Consultados: {consultadas}. Alunos fora do mapa entram como "
+                   "'Presente' no .txt.")
 
     col_f1, col_f2 = st.columns([0.55, 0.45])
     with col_f1:
@@ -1136,15 +1236,31 @@ def secao_registrar(turma, subject):
         _ids_reg = set(_disc_ids(turma["code"], subject["id"]))
         prontos = [p for p in prontos if p["turma_id"] == str(turma["code"]) and p["disciplina_id"] in _ids_reg]
 
-    selecionados = st.multiselect("Planos prontos para registrar:", options=[p["arquivo"] for p in prontos], key="reg_sel")
+    # Bloqueio: planos com data de feriado/recesso não vão para o portal
+    livres, bloqueados = [], []
+    for p in prontos:
+        desc = feriado_na_data(p.get("data", ""))
+        if desc:
+            bloqueados.append((p, desc))
+        else:
+            livres.append(p)
+    if bloqueados:
+        detalhe = ", ".join(f"`{p['arquivo']}` ({d})" for p, d in bloqueados)
+        st.warning(
+            f"⚠️ **{len(bloqueados)} plano(s) em data de feriado** — registro bloqueado: {detalhe}. "
+            "Gere novamente o planejamento (o gerador agora pula feriados) ou exclua o plano."
+        )
+
+    selecionados = st.multiselect("Planos prontos para registrar:", options=[p["arquivo"] for p in livres], key="reg_sel")
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("▶️ Registrar selecionados", type="primary", width="stretch",
                      disabled=not selecionados, key="btn_reg_sel"):
             ok, msg = registrar_planos(files=selecionados); (st.success if ok else st.error)(msg)
     with c2:
-        if st.button("▶️ Registrar TODOS os prontos", width="stretch", key="btn_reg_all"):
-            ok, msg = registrar_planos(all_files=True); (st.success if ok else st.error)(msg)
+        if st.button("▶️ Registrar TODOS os prontos", width="stretch", key="btn_reg_all",
+                     disabled=not livres):
+            ok, msg = registrar_planos(files=[p["arquivo"] for p in livres]); (st.success if ok else st.error)(msg)
     with c3:
         if st.button("🔄 Sincronizar (raspagem)", width="stretch", key="btn_raspagem"):
             ok, msg = rodar_raspagem(); (st.success if ok else st.error)(msg)
@@ -1172,6 +1288,59 @@ def secao_registrar(turma, subject):
 
 def secao_config(turma, subject):
     st.subheader("⚙️ Configurações e manutenção")
+
+    # 0) Feriados (master_config -> feriados.json)
+    st.markdown("#### 📅 Feriados (`master_config` → `feriados.json`)")
+    cfg_fer = _feriados_config()
+    if not cfg_fer:
+        st.warning("Nenhum calendário de feriados encontrado na `master_config` "
+                   "(chave `feriados.json`).")
+    else:
+        _CATS = (
+            ("feriados_e_datas_importantes", "Feriados"),
+            ("ferias_e_recessos", "Férias/Recessos"),
+            ("planejamento_e_formacao", "Planejamento/Formação"),
+            ("exames", "Exames"),
+        )
+        linhas_fer = []
+        n_datas = 0
+        for cat, rotulo in _CATS:
+            for item in cfg_fer.get(cat, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                desc = str(item.get("descricao") or "")
+                if item.get("data"):
+                    linhas_fer.append({"Categoria": rotulo, "Início": item["data"],
+                                       "Fim": item["data"], "Descrição": desc})
+                    n_datas += 1
+                elif item.get("inicio") and item.get("fim"):
+                    linhas_fer.append({"Categoria": rotulo, "Início": item["inicio"],
+                                       "Fim": item["fim"], "Descrição": desc})
+                    try:
+                        di = datetime.strptime(str(item["inicio"])[:10], "%Y-%m-%d").date()
+                        df = datetime.strptime(str(item["fim"])[:10], "%Y-%m-%d").date()
+                        n_datas += (df - di).days + 1
+                    except Exception:
+                        pass
+        col_f1, col_f2 = st.columns([0.58, 0.42])
+        with col_f1:
+            if linhas_fer:
+                st.dataframe(pd.DataFrame(linhas_fer), width="stretch",
+                             hide_index=True, height=260)
+            else:
+                st.caption("Calendário sem períodos cadastrados.")
+            st.caption(f"**{len(linhas_fer)}** período(s)/data(s) • **{n_datas}** dia(s) "
+                       "não letivo(s) • fonte: tabela `master_config`.")
+        with col_f2:
+            data_chk = st.date_input("Verificar data", value=date.today(),
+                                     key="cfg_fer_chk")
+            desc_chk = feriado_na_data(data_chk.isoformat())
+            if desc_chk:
+                st.warning(f"⚠️ `{data_chk.isoformat()}` **não é dia letivo**: {desc_chk}. "
+                           "Geração e registro de aulas bloqueados nesta data.")
+            else:
+                st.success(f"✅ `{data_chk.isoformat()}` é dia letivo "
+                           "(não consta no calendário de feriados).")
 
     # 1) Monitor de limite
     st.markdown("#### 📊 Monitor de limite (planos × carga horária)")
@@ -1234,14 +1403,13 @@ def secao_config(turma, subject):
 
     # 5) Outros parâmetros
     st.divider()
-    st.markdown("#### 🔧 Outros parâmetros (`planejamento_config`)")
-    conn = get_db()
-    cfgs = [dict(r) for r in conn.execute("SELECT chave, valor FROM planejamento_config ORDER BY chave")]
-    conn.close()
+    st.markdown("#### 🔧 Outros parâmetros (`master_config`)")
+    cfgs = core_banco.listar_parametros()
     if cfgs:
         st.dataframe(pd.DataFrame(cfgs), width="stretch", hide_index=True)
     else:
-        st.caption("Vazio.")
+        st.caption("Nenhum parâmetro cadastrado (as chaves `.json` de calendário/"
+                   "feriados ficam fora desta lista).")
     with st.form("cfg_novo"):
         c1, c2 = st.columns([0.4, 0.6])
         with c1:
