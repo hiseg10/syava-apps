@@ -281,6 +281,10 @@ perspectiva dentro do seu escopo.
   indexa `disciplina_id → {inicio, fim, carga}` pelos novos
   **`disciplina_ids`** de `restricoes_planejamento` (espelhados nas 2 fontes
   do SysAva; backup `escola_ativa_backup_calendario_20260929_200449.db`).
+  **Datas corrigidas** por sync `data/calendario_letivo.json` →
+  `master_config` (o master era import degradado de 14/06 sem
+  `sabados_letivos`/`trimestres`; ver IS-038) → anuais `19/02–17/12`, igual
+  ao fim do 3º trimestre.
 
 **Arquivos:** `apps/planejamento_registro/planejamento_registro_streamlit.py`
 (`consolidadas_data`, `load_janelas_disciplinas`, `secao_consolidadas`,
@@ -292,7 +296,10 @@ Todas → **22 disc / carga 880 / 378 registradas / 25 prontas+pendentes /
 478 faltantes / 43%**; filtro I-A → 11 / 440 / 204 / 2 / 235; Gantt com
 **22 barras** (2 anuais + mensais restantes), alinhamento rótulo × barra
 `delta = 0` nos 22 pares, eixo Y sem `2026A` nem sufixo de turma; coluna
-Janela na tabela; sem "Caderno" e sem ⚠️ de excedente.
+Janela na tabela; sem "Caderno"; ⚠️ esperado de
+`PROGRAMAÇÃO WEB FRONT-END (I-A)` (41 registros > 40 de carga).
+Sync do calendário validado: 11/11 janelas idênticas nas 2 fontes,
+`sabados_letivos` = 18 no `get_config`.
 
 ---
 
