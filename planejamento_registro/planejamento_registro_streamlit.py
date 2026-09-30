@@ -360,6 +360,22 @@ def _turma_curta(nome):
     return m.group(1) if m else str(nome)
 
 
+def _chave_disc(nome):
+    """Chave canônica da disciplina para agrupar aliases numa só linha.
+
+    Remove sufixos de turma `(...)`, variantes `2026A/2026B`, acentos e caixa:
+    'PROGRAMAÇÃO WEB FRONT-END 2026A' e 'PROGRAMAÇÃO WEB FRONT-END (2ª SÉRIE...)'
+    viram a mesma chave que 'PROGRAMAÇÃO WEB FRONT-END'.
+    """
+    import unicodedata
+    s = str(nome or "")
+    s = re.sub(r"\s*\(.*\)\s*$", "", s)
+    s = re.sub(r"\s+20\d\d[A-Za-z]\s*$", "", s)
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^A-Za-z0-9]+", " ", s).strip().upper()
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def consolidadas_data(turma_filtro=None):
     """Consolida, por turma×disciplina: carga anual, registradas (portal),
@@ -400,26 +416,37 @@ def consolidadas_data(turma_filtro=None):
                 (code,),
             ):
                 fila[str(did)] = n
+            grupos = {}
             for s in load_subjects_for_class(c["id"]):
-                ids = _disc_ids(c["code"], s["id"])
+                if _chave_disc(s["name"]).startswith("CADERNO DE ATIVIDADES"):
+                    continue  # item de apoio, fora da carga letiva (Escola.txt)
+                chave = _chave_disc(s["name"])
+                grupos.setdefault(chave, []).append(s)
+            for chave, membros in grupos.items():
+                # Alias (ex.: '4' e '30', '6', '31', '33', '34') = UMA disciplina
+                ids = set()
+                for m in membros:
+                    ids.update(_disc_ids(c["code"], m["id"]))
+                    ids.add(str(m["id"]))
+                ids = sorted(ids)
                 reg = sum(hist.get((code, i), 0) for i in ids)
                 fl = sum(fila.get(i, 0) for i in ids)
                 pr = sum(txt_idx.get(("prontas", code, i), 0) for i in ids)
                 pe = sum(txt_idx.get(("pendentes", code, i), 0) for i in ids)
-                carga = int(s["max_hours"]) if s.get("max_hours") else 40
-                jan = janelas.get(str(s["id"]))
-                if jan is None:
-                    for i in ids:
-                        if i in janelas:
-                            jan = janelas[i]
-                            break
+                carga = max(int(m["max_hours"]) if m.get("max_hours") else 40
+                            for m in membros)
+                jan = None
+                for i in ids:
+                    if i in janelas:
+                        jan = janelas[i]
+                        break
                 linhas.append({
                     "turma": c["name"],
                     "turma_code": code,
                     "turma_curta": _turma_curta(c["name"]),
-                    "disciplina": s["name"],
-                    "disciplina_id": s["id"],
-                    "ativa": str(s.get("is_active")) == "1",
+                    "disciplina": membros[0]["name"],
+                    "disciplina_id": membros[0]["id"],
+                    "ativa": any(str(m.get("is_active")) == "1" for m in membros),
                     "carga": carga,
                     "registradas": reg,
                     "prontas": pr,
@@ -955,8 +982,9 @@ def secao_consolidadas(turma, subject):
     if not dados:
         st.info("Nenhuma disciplina encontrada.")
         return
-    ativas = [d for d in dados if d["ativa"]]
-    base = ativas or dados
+    # Base = TODAS as disciplinas letivas (11 por turma, aliases agrupados;
+    # vê `data/Turmas/Escola.txt`). O flag "ativa" só diz qual está em uso.
+    base = dados
 
     tot_carga = sum(d["carga"] for d in base)
     tot_reg = sum(d["registradas"] for d in base)
@@ -998,7 +1026,7 @@ def secao_consolidadas(turma, subject):
                    "a linha tracejada marca **hoje**.")
         df_jan = pd.DataFrame(jan_rows).sort_values("Inicio")
         ordenacao = df_jan["Disciplina"].tolist()
-        barras = alt.Chart(df_jan).mark_bar(cornerRadius=3, size=16).encode(
+        barras = alt.Chart(df_jan).mark_bar(cornerRadius=3).encode(
             x=alt.X("Inicio:T", title="2026", scale=alt.Scale(
                 domain=[df_jan["Inicio"].min(), df_jan["Fim"].max()])),
             x2="Fim:T",
@@ -1015,7 +1043,8 @@ def secao_consolidadas(turma, subject):
         )
         hoje = alt.Chart(pd.DataFrame({"d": [pd.Timestamp(datetime.now().date())]})) \
             .mark_rule(color="#d32f2f", strokeDash=[5, 4], size=2).encode(x="d:T")
-        st.altair_chart(barras + hoje, width="stretch", height=420)
+        alt_h = max(420, 26 * len(df_jan) + 90)
+        st.altair_chart(barras + hoje, width="stretch", height=alt_h)
     else:
         st.info("Nenhuma janela de disciplina encontrada no calendário letivo.")
 
@@ -1034,8 +1063,6 @@ def secao_consolidadas(turma, subject):
     st.markdown("#### 📚 Carga anual × registradas por turma")
     por_turma = {}
     for d in consolidadas_data(None):
-        if not d["ativa"] and ativas:
-            continue
         t = por_turma.setdefault(d["turma"], {"Carga anual": 0, "Registradas": 0})
         t["Carga anual"] += d["carga"]
         t["Registradas"] += d["registradas"]

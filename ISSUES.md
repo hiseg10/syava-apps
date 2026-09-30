@@ -256,17 +256,26 @@ perspectiva dentro do seu escopo.
 - Nova navegação **📈 Consolidadas** (`_SECOES` + `st.radio` logo após o
   Painel) com `secao_consolidadas()`.
 - `consolidadas_data(turma_filtro)` (`@st.cache_data(ttl=30)`): por
-  turma × disciplina — carga (`subjects.max_hours`, padrão 40), registradas
+  turma × disciplina — carga (`subjects.max_hours`), registradas
   (`historico_aulas`, excluindo `Aula Exclu%`), prontas/pendentes (`.txt` em
   `aulas/prontas|pendentes`), fila (`planejamento`) e
-  `faltantes = max(0, carga − reg − prontas − pendentes)`; aliases por
-  `_disc_ids()`; base = disciplinas `is_active=1` (fallback p/ inativas).
+  `faltantes = max(0, carga − reg − prontas − pendentes)`.
+- **Carga corrigida para 880h** (11 disciplinas × 40h × 2 turmas, base
+  `data/Turmas/Escola.txt`): agrupa aliases pelo **nome canônico**
+  (`_chave_disc()` — remove `(…)`, `2026A/B`, acento e caixa), porque
+  `class_subjects` tem 14 linhas/turma com duplicatas de sync (POO = ids
+  `4+30`; WEB FRONT-END = `6+31+33+34`, mas `turma_disciplina_config` só
+  cobre `33/34 → 6`) → **1 linha de 40h por disciplina**. **"Caderno de
+  Atividades"** (subject 35) fica fora da carga; `ativa = algum membro
+  ativo`; a base **não** filtra inativas (todas as 22 linhas aparecem).
 - UI: seletor "Todas as turmas" (default), 5 KPIs, `st.progress` de avanço,
   ⚠️ de excedente, gráfico 1 (fluxo empilhado por disciplina), gráfico 2
   (carga anual × registradas por turma) e tabela **Detalhamento**.
-- **Gantt "Janela de cada disciplina no ano letivo"** (Altair): barra
-  `inicio → fim` por disciplina, cor por escopo (Anual > 200 dias / Mensal),
-  régua tracejada = hoje, ordenada por início; coluna **Janela** na tabela.
+- **Gantt "Janela de cada disciplina no ano letivo"** (Altair, 22 barras):
+  barra `inicio → fim` por disciplina, cor por escopo (Anual > 200 dias /
+  Mensal), régua tracejada = hoje, ordenada por início; altura dinâmica
+  `max(420, 26 × n + 90)` e `axis.labelLimit=260` (rotulos de 28 chars não
+  truncam); coluna **Janela** na tabela.
 - `load_janelas_disciplinas()`: lê `master_config['calendario_letivo.json']`
   (mesma fonte do gerador) com fallback p/ `data/calendario_letivo.json` e
   indexa `disciplina_id → {inicio, fim, carga}` pelos novos
@@ -279,10 +288,11 @@ perspectiva dentro do seu escopo.
 `master_config['calendario_letivo.json']` (não versionados).
 
 **Validação:** `py_compile` OK; QA navegador (8510, 0 erros de console):
-Todas → 10 disc / carga 400 / 218 registradas / 25 prontas+pendentes / 158
-faltantes / 54%; filtro I-A → 5 / 200 / 124; Gantt renderiza 10 barras (6
-anuais + 4 mensais) com régua de hoje, 5 barras no filtro I-A; coluna
-Janela na tabela; ⚠️ de excedente de FRONT-END 2026A (alias 33↔6) esperado.
+Todas → **22 disc / carga 880 / 378 registradas / 25 prontas+pendentes /
+478 faltantes / 43%**; filtro I-A → 11 / 440 / 204 / 2 / 235; Gantt com
+**22 barras** (2 anuais + mensais restantes), alinhamento rótulo × barra
+`delta = 0` nos 22 pares, eixo Y sem `2026A` nem sufixo de turma; coluna
+Janela na tabela; sem "Caderno" e sem ⚠️ de excedente.
 
 ---
 
