@@ -20,9 +20,22 @@ também recebeu; ver `SysAva/docs/CI_WORKFLOW.md`.
 ## Rodar o mesmo em casa
 
 ```bash
-git ls-files -z "*.py" | xargs -0 -r python -m py_compile   # sintaxe
+# Linux/macOS/WSL (bash) — também é o que o CI roda:
+git ls-files -z "*.py" | xargs -0 -r python -m py_compile && echo "OK - sintaxe"
 pytest -q                                                   # quando existir tests/
 ```
+
+```powershell
+# Windows/PowerShell (não tem xargs) — silencioso no sucesso? Use esta:
+$arq = git ls-files "*.py"; $err = 0
+$arq | ForEach-Object { python -m py_compile $_; if ($LASTEXITCODE -ne 0) { $err++ } }
+if ($err) { "ERROS: $err arquivo(s)"; exit 1 } else { "OK - $($arq.Count) arquivos compilados" }
+pytest -q                                                   # quando existir tests/
+```
+
+> Sem mensagem = sucesso (`py_compile` só fala em erro). O erro
+> `fatal: '\' is outside repository` aparece ao colar a linha `\|` da tabela
+> markdown — use a linha `|` acima.
 
 ## Como ampliar
 
