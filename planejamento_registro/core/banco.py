@@ -98,6 +98,25 @@ def listar_parametros():
         conn.close()
 
 
+def del_config(chave):
+    """Remove uma configuração da ``master_config`` (recusa chaves ``.json``)."""
+    chave = str(chave).strip()
+    if not chave:
+        raise ValueError("Chave vazia.")
+    if chave.endswith(".json"):
+        raise ValueError("Chaves `.json` (calendário/feriados) não podem ser excluídas.")
+    conn = get_db()
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(master_config)")]
+        if 'key' in cols:
+            conn.execute("DELETE FROM master_config WHERE key = ?", (chave,))
+        else:
+            conn.execute("DELETE FROM master_config WHERE chave = ?", (chave,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # IDs equivalentes de disciplina (filha <-> base/alias)
 # ---------------------------------------------------------------------------

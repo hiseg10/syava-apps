@@ -84,6 +84,107 @@ def _ordenar_lessons_fila(lessons_list):
     return sorted(lessons_list, key=_chave)
 
 
+def flag_verdadeira(valor):
+    """Normaliza flags vindas da ``master_config`` (bool, int ou string)."""
+    if isinstance(valor, str):
+        return valor.strip().lower() in ("true", "1", "sim", "yes")
+    return bool(valor)
+
+
+def sabados_bloqueados(project_root=PROJECT_ROOT):
+    """True quando ``bloquear_sabados_letivos`` está ativo na ``master_config``."""
+    try:
+        return flag_verdadeira(database_model.get_config('bloquear_sabados_letivos', project_root))
+    except Exception:
+        return False
+
+
+def resolver_sabados_config(calendario, project_root=PROJECT_ROOT):
+    """Mapa ``{data_iso: dia_equivalente}`` dos sábados letivos; vazio se bloqueado.
+
+    Com o bloqueio ativo, ``gerar_txt_planos`` ignora qualquer sábado (regra
+    753–757: dia sem entrada em ``sabados_config`` é pulado) — os planos de
+    sábado passam a ser só manuais (aba Sábados (reposição)).
+    """
+    if sabados_bloqueados(project_root):
+        return {}
+    sabados_config = {}
+    for sat in (calendario or {}).get('sabados_letivos', []):
+        d_iso = sat.get('data_iso')
+        if not d_iso and sat.get('data'):
+            try:
+                d_iso = datetime.strptime(sat['data'], "%d/%m/%Y").date().isoformat()
+            except Exception:
+                pass
+        if d_iso and sat.get('dia_equivalente'):
+            sabados_config[d_iso] = sat.get('dia_equivalente')
+    return sabados_config
+
+
+def tolerancia_janela(project_root=PROJECT_ROOT):
+    """Dias de tolerância (para mais e para menos) nas janelas do plano anual.
+
+    A janela de cada disciplina modular em ``restricoes_planejamento`` vale
+    ``[inicio - tol, fim + tol]`` na resolução dos slots genéricos ("Disc.Tec.").
+    Configurável via ``tolerancia_janela_dias`` na ``master_config`` (padrão 15).
+    """
+    try:
+        v = database_model.get_config('tolerancia_janela_dias', project_root)
+        if v is None or str(v).strip() == '':
+            return 15
+        n = int(float(str(v).strip().replace(',', '.')))
+        return max(0, n)
+    except Exception:
+        return 15
+
+
+def janelas_modulares(calendario, tol):
+    """Janelas modulares do plano anual, já com a tolerância aplicada.
+
+    Anuais (>300 dias, ex.: IA/Mentorias/P.C.II) ficam de fora: na grade elas
+    têm slot nomeado e a resolução por data não precisa delas (AP-011).
+    """
+    out = []
+    for nome, cfg in ((calendario or {}).get('restricoes_planejamento') or {}).items():
+        try:
+            ini = datetime.strptime(cfg['data_inicio'], "%d/%m/%Y").date()
+            fim = datetime.strptime(cfg['data_fim'], "%d/%m/%Y").date()
+        except Exception:
+            continue
+        if (fim - ini).days > 300:
+            continue
+        out.append({
+            'nome': nome,
+            'ini': ini,
+            'fim': fim,
+            'ext_ini': ini - timedelta(days=tol),
+            'ext_fim': fim + timedelta(days=tol),
+            'ids': {str(i) for i in (cfg.get('disciplina_ids') or [])},
+        })
+    out.sort(key=lambda j: j['ini'])
+    return out
+
+
+def janela_por_data(janelas, data):
+    """Janela modular ativa em ``data`` (disputa resolvida por menor distância).
+
+    Dentro da janela original a distância é 0; fora dela, vale a menor
+    distância até o início ou o fim (tolerância ±N dias das janelas vizinhas
+    pode sobrepor). Empate → janela mais antiga do plano.
+    """
+    candidatos = [j for j in janelas if j['ext_ini'] <= data <= j['ext_fim']]
+    if not candidatos:
+        return None
+
+    def _dist(j):
+        if j['ini'] <= data <= j['fim']:
+            return 0
+        return min(abs((data - j['ini']).days), abs((data - j['fim']).days))
+
+    candidatos.sort(key=lambda j: (_dist(j), j['ini']))
+    return candidatos[0]
+
+
 def gerar_txt_planos(
     auto_confirm: bool = True,
     output_dir: str = "pendentes",
@@ -165,47 +266,6 @@ def gerar_txt_planos(
                 return info
         return None
 
-    def get_next_modular_subject(restricoes, next_aula_num, mapa_disciplinas, curr_date, turma_id, turma_to_monthly):
-        """Encontra a próxima disciplina modular ativa que precisa de aulas."""
-        curr_date_obj = curr_date if isinstance(curr_date, datetime) else datetime.strptime(curr_date, "%Y-%m-%d").date()
-        
-        # Filtra a disciplina esperada para esta turma
-        disciplina_esperada = turma_to_monthly.get(turma_id)
-        # print(f"DEBUG: Turma {turma_id} -> Disciplina esperada: {disciplina_esperada}")
-        
-        # Filtra apenas modulares (< 300 dias)
-        modulares = []
-        for k, v in restricoes.items():
-            try:
-                # Verifica se a disciplina (ou seu alias) coincide com a esperada para a turma
-                if disciplina_esperada:
-                    # Normaliza para comparar
-                    nome_restricao = normalize_key_local(k)
-                    nome_esperado = normalize_key_local(disciplina_esperada)
-                    # Verifica flexibilidade: se um é parte do outro ou se correspondem
-                    # (ex: PROGRAMACAOWEBFRONTEND2026A contem PROGRAMACAOWEBFRONTEND)
-                    if nome_restricao not in nome_esperado and nome_esperado not in nome_restricao:
-                        continue
-                
-                m_ini = datetime.strptime(v['data_inicio'], "%d/%m/%Y").date()
-                m_fim = datetime.strptime(v['data_fim'], "%d/%m/%Y").date()
-                if (m_fim - m_ini).days > 300:
-                    continue  # Anual, pular
-                if m_ini <= curr_date_obj <= m_fim:
-                    modulares.append((k, m_ini, m_fim))
-            except:
-                continue
-        # Ordena por data de início
-        modulares.sort(key=lambda x: x[1])
-        for mod_name, _, _ in modulares:
-            d_info = resolve_subject_info_local(mod_name, mapa_disciplinas)
-            if d_info:
-                did = d_info['id']
-                current_count = next_aula_num.get(did, 0)
-                if current_count < 50:  # Limite generoso
-                    return mod_name, d_info
-        return None, None
-
     # --- Constantes internas ---
     LIMITE_AULAS_REGULAR = 40
     GENERIC_KEYWORDS = ["DISCTEC", "DISCITEC", "TECNICO", "DISC_TEC", "DISC_TECNICA"]
@@ -279,25 +339,6 @@ def gerar_txt_planos(
         if c.get('portal_name'):
             mapa_turmas[c['portal_name']] = code
             mapa_turmas_norm[normalize_key_local(c['portal_name'])] = code
-
-    # 2.1 Carregar disciplina mensal configurada por turma (da tabela settings)
-    monthly_by_class = {}
-    try:
-        cursor.execute("SELECT chave, valor FROM settings WHERE chave LIKE 'disciplina_mensal_%'")
-        for r in cursor.fetchall():
-            chave = r['chave']
-            valor = r['valor']
-            if chave.startswith('disciplina_mensal_') and chave != 'disciplina_mensal_atual':
-                mid = chave.replace('disciplina_mensal_', '')
-                monthly_by_class[mid] = valor
-    except:
-        pass
-
-    # Mapear turma_id -> nome da disciplina mensal (nao sombrear o parametro turma_id!)
-    turma_to_monthly = {}
-    for mid, disc_name in monthly_by_class.items():
-        turma_code_m = mapa_id_para_code.get(mid, mid)
-        turma_to_monthly[turma_code_m] = disc_name
 
     # 3. Carregar grade horária
     cursor.execute("SELECT class_name, day_of_week, time_slot, subject_name FROM weekly_schedule")
@@ -419,6 +460,32 @@ def gerar_txt_planos(
     for k in lessons_by_subject:
         lessons_by_subject[k] = _ordenar_lessons_fila(lessons_by_subject[k])
 
+    # IS-045: Livro-caixa (services.livro_caixa) — estrutura em blocos com
+    # zonas livres para aulas especiais. Só disciplinas COM documento entram
+    # nesta fila (chave: subject_id da lessons); qualquer falha aqui cai na
+    # fila legada acima, sem mudança de comportamento.
+    filas_livro = {}   # key → (entradas_resolvidas, {aula_numero: lesson})
+    try:
+        from services import livro_caixa as _livro_caixa
+        for _sid, _doc in _livro_caixa.carregar_todos().items():
+            _entradas = _livro_caixa.resolver(_doc)
+            if not _entradas:
+                continue
+            _num_map = {}
+            for _k in {_sid, str(_sid), int(_sid) if str(_sid).isdigit() else _sid}:
+                _ll = lessons_by_subject.get(_k)
+                if not _ll:
+                    continue
+                for _l in _ll:
+                    if _eh_lesson_planejavel(_l.get('title')):
+                        _n = _numero_aula(_l.get('title'))
+                        if _n:
+                            _num_map[_n] = _l
+                for _kk in {_k, str(_k), int(_k) if str(_k).isdigit() else _k}:
+                    filas_livro[_kk] = (_entradas, _num_map)
+    except Exception:
+        filas_livro = {}
+
     # 7. Carregar calendário letivo
     calendario = database_model.get_config('calendario_letivo.json', PROJECT_ROOT) or {}
     data_inicio_str = calendario.get('data_inicio', '01/02/2026')
@@ -427,16 +494,8 @@ def gerar_txt_planos(
     data_fim = datetime.strptime(data_fim_str, "%d/%m/%Y").date()
 
     # 7b. Configuração de sábados letivos / reposição
-    sabados_config = {}
-    for sat in calendario.get('sabados_letivos', []):
-        d_iso = sat.get('data_iso')
-        if not d_iso and sat.get('data'):
-            try:
-                d_iso = datetime.strptime(sat['data'], "%d/%m/%Y").date().isoformat()
-            except Exception:
-                pass
-        if d_iso and sat.get('dia_equivalente'):
-            sabados_config[d_iso] = sat.get('dia_equivalente')
+    # (vazio quando a flag 'bloquear_sabados_letivos' está ativa — sábado manual)
+    sabados_config = resolver_sabados_config(calendario, PROJECT_ROOT)
 
     # 8. Carregar feriados
     feriados_config = database_model.get_config('feriados.json', PROJECT_ROOT) or {}
@@ -489,9 +548,9 @@ def gerar_txt_planos(
         disciplina_duration_type = {}
 
     # 9c. Carregar TODAS as configs turma-disciplina (aliases_id)
-    # Estrutura: {(turma_id, disciplina_id): config} e {turma_id: config} (uma por turma)
+    # Estrutura: {(turma_id, disciplina_id): config} — só busca EXATA (AP-011);
+    # nunca "primeira linha da turma" (embaralhava aliases entre disciplinas).
     turma_disc_configs_all = {}
-    turma_disc_config_by_turma = {}
     try:
         cursor.execute("""
             SELECT turma_id, disciplina_id, data_inicio, data_fim, aliases_id
@@ -507,11 +566,6 @@ def gerar_txt_planos(
             }
             turma_disc_configs_all[(str(row[0]), str(row[1]))] = cfg
             turma_disc_configs_all[(int(row[0]), int(row[1]))] = cfg
-            # Índice por turma: se turma já tem config, não sobrescreve
-            if row[0] not in turma_disc_config_by_turma:
-                turma_disc_config_by_turma[row[0]] = cfg
-            if str(row[0]) not in turma_disc_config_by_turma:
-                turma_disc_config_by_turma[str(row[0])] = cfg
     except:
         pass
 
@@ -627,27 +681,51 @@ def gerar_txt_planos(
                 max_pos = max(sequence_map[key].keys())
             next_aula_num[key] = max(next_aula_num.get(key, 0), effective_cnt, max_pos)
 
-    # Inicializar com planejamento pendente.
+    # Inicializar com o maior numero_aula já existente no planejamento.
     # Em modo "Sobrescrever" (force_overwrite), os pendentes existentes serão
     # regenerados e re-numerados a partir do histórico (ordem natural consecutiva),
-    # portanto NÃO somam à contagem de partida aqui (IS-019).
+    # portanto NÃO entram na contagem de partida aqui (IS-019).
+    # IS-042 (D2): MAX(numero_aula) em vez de COUNT(*) — a contagem de linhas
+    # derivava com exclusões e com a mudança de status (pendente/pronta ->
+    # registrada) e terminava duplicando números entre rodadas (nº 30 em
+    # 17/09 x 01/10) ou partindo de um número já usado.
     cursor.execute("""
-        SELECT turma_id, disciplina_id, COUNT(*) as cnt
+        SELECT turma_id, disciplina_id, MAX(CAST(numero_aula AS INTEGER)) as max_num
         FROM planejamento
         WHERE status IN ('pendente', 'pronta')
+          AND numero_aula IS NOT NULL AND TRIM(numero_aula) != ''
         GROUP BY turma_id, disciplina_id
     """)
     if not force_overwrite:
         for r in cursor.fetchall():
             tid = str(r['turma_id'])
             did = str(r['disciplina_id'])
-            cnt = int(r['cnt'])
+            max_num = int(r['max_num'] or 0)
             for key in [(tid, did), (tid, int(did) if did.isdigit() else did)]:
-                next_aula_num[key] = next_aula_num.get(key, 0) + cnt
+                next_aula_num[key] = max(next_aula_num.get(key, 0), max_num)
 
     # --- Regra de inicio: ultima aula registrada (piso: data de corte) ---
     # Sabados letivos seguem apenas a data de corte.
     inicio_map, base_inicio = regras_datas.inicio_geracao(data_corte, data_inicio)
+
+    # --- Janelas do plano anual (restricoes_planejamento) com tolerância ---
+    # Os slots genéricos ("Disc.Tec.") passam a resolver por DATA do plano
+    # (±tolerancia_janela_dias) em vez da disciplina mensal de
+    # settings.disciplina_mensal_*, que ficava stale e travava todos os slots
+    # na mesma disciplina mesmo depois da janela dela encerrar (AP-011).
+    tol_dias = tolerancia_janela(PROJECT_ROOT)
+    janelas = janelas_modulares(calendario, tol_dias)
+
+    # --- Piso da fila Disc.Tec.: ÚLTIMA AULA MODULAR registrada (IS-043) ---
+    # Para disciplinas modulares/mensais o portal tem prioridade sobre o
+    # calendário anual: elas não começam antes da última aula registrada
+    # entre as janelas modulares da turma, mesmo que a tolerância ±tol da
+    # janela vizinha ainda permita a data (caso: Fundamentos UI gerado em
+    # 18/05 com Front-End registrada no portal até 03/06).
+    ids_modulares = set()
+    for j in janelas:
+        ids_modulares |= (j.get('ids') or set())
+    ids_modulares, ultima_modular = regras_datas.ultima_aula_modular(ids_modulares)
 
     # Logs de debug
     debug_info = {
@@ -664,13 +742,27 @@ def gerar_txt_planos(
         "disciplinas": [{"id": s['id'], "name": s['name']} for s in subjects_raw[:10]],
         "grade_sample": [{"turma": g['class_name'], "dia": g['day_of_week'], "horario": g['time_slot'], "disc": g['subject_name']} for g in grade_raw[:10]],
         "calendario": {"inicio": data_inicio_str, "fim": data_fim_str},
+        "sabados_configurados": len(sabados_config),
+        "sabados_bloqueados": sabados_bloqueados(PROJECT_ROOT),
         "data_corte": data_corte.isoformat() if data_corte else None,
+        "tolerancia_janela_dias": tol_dias,
+        "janelas_plano": [
+            {"nome": j["nome"],
+             "janela": f'{j["ini"].isoformat()}..{j["fim"].isoformat()}',
+             "com_tolerancia": f'{j["ext_ini"].isoformat()}..{j["ext_fim"].isoformat()}'}
+            for j in janelas
+        ],
+        "piso_modular_turmas": {t: d.isoformat() for t, d in sorted(ultima_modular.items())},
         "next_aula_num_sample": {f"{k[0]}_{k[1]}": v for k, v in list(next_aula_num.items())[:5]},
     }
 
     # --- Geração dos planos ---
     novos_planos = []
-    debug_counters = {"turmas_iteradas": 0, "dias_iterados": 0, "slots_processados": 0, "slots_gerados": 0, "slots_pulados": [], "sem_licao": 0, "freq_outra_disciplina": []}
+    debug_counters = {"turmas_iteradas": 0, "dias_iterados": 0, "slots_processados": 0, "slots_gerados": 0, "slots_pulados": [], "sem_licao": 0, "especiais": 0, "freq_outra_disciplina": [], "resolvido_por_disciplina": {}, "descartados": {}}
+
+    def _descarta(motivo):
+        d = debug_counters["descartados"]
+        d[motivo] = d.get(motivo, 0) + 1
 
     # Ordenar grade por dia da semana e horário
     grade_ordenada = sorted(grade_raw, key=lambda x: (
@@ -714,6 +806,23 @@ def gerar_txt_planos(
                         filtro_disc_ids.add(str(cd))
                     if str(cd) == did_str and cfg.get('aliases_id'):
                         filtro_disc_ids.add(str(cfg.get('aliases_id')))
+
+    # Janela da disciplina filtrada: quando a data cai na janela tolerada da
+    # disciplina selecionada, o slot genérico resolve para ELA — a tolerância
+    # de ±N dias manda sobre a janela vizinha do plano (AP-011).
+    janela_filtro = None
+    if filtro_disc_ids:
+        for j in janelas:
+            if j['ids'] and (j['ids'] & filtro_disc_ids):
+                janela_filtro = j
+                break
+        if not janela_filtro:
+            # Fallback: janelas sem disciplina_ids (ou ids desatualizados)
+            for j in janelas:
+                d_j = resolve_subject_info_local(j['nome'], mapa_disciplinas)
+                if d_j and str(d_j['id']) in filtro_disc_ids:
+                    janela_filtro = j
+                    break
 
     # Iterar sobre turmas
     turmas_ativas = sorted(list({g['class_name'] for g in grade_raw}))
@@ -799,36 +908,24 @@ def gerar_txt_planos(
                 gn = normalize_key_local(disciplina_grade)
                 is_generic = disciplina_grade.strip() in GENERIC_LABELS
 
-                # Inicializar restricoes globais (serao usadas se nao houver configuracao turma-especifica)
-                restricoes_global = calendario.get('restricoes_planejamento', {})
-
                 disc_id = None
                 disc_name = disciplina_grade
 
                 if is_generic:
-                    # Resolver "Disc.Tec." via configuração mensal do settings
-                    disc_mensal = turma_to_monthly.get(turma_code)
-                    if disc_mensal:
-                        d_info = resolve_subject_info_local(disc_mensal, mapa_disciplinas)
-                        if d_info:
-                            disc_id = d_info['id']
-                            disc_name = d_info['name']
-                    
-                    if not disc_id:
-                        # Fallback: usar fila de modulares
-                        turma_disc_config = turma_disc_config_by_turma.get(turma_code)
-                        if turma_disc_config and turma_disc_config.get('data_inicio') and turma_disc_config.get('data_fim'):
-                            restricoes_usadas = {
-                                turma_disc_config['data_inicio']: {'data_fim': turma_disc_config['data_fim']}
-                            }
-                        else:
-                            restricoes_usadas = restricoes_global
-
-                        mod_name, d_info = get_next_modular_subject(
-                            restricoes_usadas,
-                            next_aula_num, mapa_disciplinas,
-                            data_iso, turma_code, turma_to_monthly
-                        )
+                    # Slot genérico ("Disc.Tec."): resolve pela janela do plano
+                    # anual com tolerância (±tol_dias). A disciplina mensal de
+                    # settings.disciplina_mensal_* NÃO é mais consultada aqui:
+                    # um valor stale engessava todos os slots na mesma
+                    # disciplina mesmo depois da janela dela encerrar (AP-011).
+                    janela = None
+                    if (janela_filtro
+                            and janela_filtro['ext_ini'] <= curr_date <= janela_filtro['ext_fim']):
+                        # Data dentro da janela tolerada da disciplina selecionada
+                        janela = janela_filtro
+                    else:
+                        janela = janela_por_data(janelas, curr_date)
+                    if janela:
+                        d_info = resolve_subject_info_local(janela['nome'], mapa_disciplinas)
                         if d_info:
                             disc_id = d_info['id']
                             disc_name = d_info['name']
@@ -840,32 +937,65 @@ def gerar_txt_planos(
                         disc_name = d_info['name']
 
                 if not disc_id:
+                    debug_counters["resolvido_por_disciplina"]["(sem janela no plano)"] = \
+                        debug_counters["resolvido_por_disciplina"].get("(sem janela no plano)", 0) + 1
                     continue
 
-                # Busca alias correspondente a esta turma e disciplina
+                debug_counters["resolvido_por_disciplina"][disc_name] = \
+                    debug_counters["resolvido_por_disciplina"].get(disc_name, 0) + 1
+
+                # Busca alias correspondente a esta turma e disciplina.
+                # APENAS linha exata ou linha cujo aliases_id bate com a disciplina
+                # resolvida (ex.: resolvida=6 base, linha da turma 34/aliases_id=6).
+                # O antigo fallback "primeira linha da turma" emprestava o alias de
+                # OUTRA disciplina (ex.: Fundamentos herdava alias 6 do Front-End e
+                # o seq começava em 17, além do conteúdo errado) (AP-011).
                 cfg_alias = (
                     turma_disc_configs_all.get((str(turma_code), str(disc_id)))
                     or turma_disc_configs_all.get((int(turma_code) if str(turma_code).isdigit() else turma_code, int(disc_id) if str(disc_id).isdigit() else disc_id))
-                    or turma_disc_config_by_turma.get(turma_code)
-                    or turma_disc_config_by_turma.get(str(turma_code))
                     or {}
                 )
+                if not cfg_alias:
+                    for _cfg in turma_disc_configs_all.values():
+                        if (str(_cfg.get('turma_id')) == str(turma_code)
+                                and str(_cfg.get('aliases_id') or '') == str(disc_id)):
+                            cfg_alias = _cfg
+                            break
                 alias_id = cfg_alias.get('aliases_id')
 
                 # ── Filtro por disciplina ──
                 if filtro_disc_ids:
                     alias_disc_id = str(alias_id or '')
                     if str(disc_id) not in filtro_disc_ids and alias_disc_id not in filtro_disc_ids:
+                        _descarta('filtro_disciplina')
                         continue
 
                 # Regra de data: dias uteis comecam apos a ultima aula registrada
                 # (piso: data de corte). Sabados letivos seguem apenas a data de corte.
                 if curr_date.weekday() != 5:
-                    if curr_date < regras_datas.inicio_disciplina(inicio_map, base_inicio, turma_code, disc_id, alias_id):
+                    limite = regras_datas.inicio_disciplina(
+                        inicio_map, base_inicio, turma_code, disc_id, alias_id)
+                    # IS-043: a fila Disc.Tec. (modular) não começa antes da
+                    # última AULA MODULAR registrada no portal da turma — o
+                    # critério do portal manda sobre o calendário e a tolerância.
+                    # IS-046: o piso vale o PRÓPRIO dia da última aula (dia da
+                    # transição). O slot da aula já registrada é pulado pela
+                    # ocupação acima, então os slots livres restantes daquele
+                    # dia podem ir para a disciplina seguinte — antes, o "+1 dia"
+                    # deixava esses horários ociosos no dia em que a anterior
+                    # encerra (ex.: Front-End termina 03/06 07:10 e o slot das
+                    # 08:10 da quarta ficava sem dono).
+                    if is_generic or str(disc_id) in ids_modulares:
+                        ult = ultima_modular.get(str(turma_code))
+                        if ult:
+                            limite = max(limite, ult)
+                    if curr_date < limite:
+                        _descarta('antes_inicio_disciplina')
                         continue
 
                 # Verificar bloqueio do portal
                 if (data_iso, turma_code, str(disc_id)) in blocked_dates:
+                    _descarta('bloqueado_portal')
                     continue
 
                 # Número sequencial no portal iSeduc
@@ -895,12 +1025,15 @@ def gerar_txt_planos(
 
                 # Se já atingiu a carga horária máxima da disciplina, não gera mais aulas
                 if seq_num > max_hours_disc:
+                    _descarta('max_hours')
                     continue
 
                 # Filtro opcional de intervalo de aulas a gerar
                 if aula_min is not None and aula_min > 0 and seq_num < aula_min:
+                    _descarta('aula_menor_que_min')
                     continue
                 if aula_max is not None and aula_max > 0 and seq_num > aula_max:
+                    _descarta('aula_maior_que_max')
                     continue
 
                 # ID interno para lessons
@@ -911,27 +1044,55 @@ def gerar_txt_planos(
                     elif str(turma_code) == '314114':
                         internal_disc_id = 34
 
-                # Determina a lição pedagógica: se mapeada no sequence_map usa o marco, senão usa cálculo sequencial
-                key_alias_seq = (turma_code, cfg_alias.get('aliases_id') or disc_id)
-                mapped_pedag = (
-                    sequence_map.get(key_cont, {}).get(seq_num)
-                    or sequence_map.get(key_alias_seq, {}).get(seq_num)
-                )
-
-                if mapped_pedag:
-                    pedagogical_idx = mapped_pedag
-                else:
-                    pedagogical_idx = seq_num
-
                 # Buscar conteúdo pedagógico
                 lessons_list = lessons_by_subject.get(internal_disc_id) or lessons_by_subject.get(disc_id, [])
+
+                # IS-045: fila do livro-caixa — a POSIÇÃO (seq_num) manda:
+                # pos N da estrutura → conteúdo do bloco N ou aula especial da
+                # zona (título vindo do plugin Atividades). Sem doc, ou fora da
+                # cobertura, vale o caminho legado abaixo. O número do título
+                # PODE divergir da posição (AULA_NUM é figurante no portal).
+                fila_lc = filas_livro.get(internal_disc_id) or filas_livro.get(disc_id)
+                pedagogical_idx = seq_num
+                item_lc = None
                 lesson = None
-                if 0 < pedagogical_idx <= len(lessons_list):
-                    _candidata = lessons_list[pedagogical_idx - 1]
-                    # Só planeja lessons com título "Aula XX"; lessons sem essa
-                    # estrutura (fragmentos/placeholders) ficam fora da fila.
-                    if _eh_lesson_planejavel(_candidata.get('title')):
-                        lesson = _candidata
+                if fila_lc is not None:
+                    entradas_lc, num_map_lc = fila_lc
+                    if 1 <= seq_num <= len(entradas_lc):
+                        item_lc = entradas_lc[seq_num - 1]
+                        if item_lc.get('tipo') == 'conteudo':
+                            lesson = num_map_lc.get(item_lc.get('aula_numero'))
+
+                if item_lc is None:
+                    # Legado: se mapeada no sequence_map usa o marco, senão usa
+                    # cálculo sequencial (índice posicional na fila por título)
+                    key_alias_seq = (turma_code, cfg_alias.get('aliases_id') or disc_id)
+                    mapped_pedag = (
+                        sequence_map.get(key_cont, {}).get(seq_num)
+                        or sequence_map.get(key_alias_seq, {}).get(seq_num)
+                    )
+                    if mapped_pedag:
+                        pedagogical_idx = mapped_pedag
+                    else:
+                        pedagogical_idx = seq_num
+                    if 0 < pedagogical_idx <= len(lessons_list):
+                        _candidata = lessons_list[pedagogical_idx - 1]
+                        # Só planeja lessons com título "Aula XX"; lessons sem
+                        # essa estrutura ficam fora da fila.
+                        if _eh_lesson_planejavel(_candidata.get('title')):
+                            lesson = _candidata
+
+                # Aula especial do livro-caixa: ocupa a posição como avaliação
+                # (NÃO é "sem lição"; não existe em `lessons`, é do Atividades)
+                especial_lc = None
+                if not lesson and item_lc and item_lc.get('tipo') == 'especial':
+                    especial_lc = item_lc
+                    lesson = {
+                        'title': item_lc.get('titulo') or f"{disc_name} - Aula {seq_num}",
+                        'description': item_lc.get('descricao') or '',
+                        'video_url': '',
+                    }
+                    debug_counters["especiais"] += 1
 
                 # Se não tem lição em lessons:
                 # Se for para a pasta 'prontas', NUNCA salva em prontas sem lição!
@@ -939,6 +1100,7 @@ def gerar_txt_planos(
                     debug_counters["sem_licao"] += 1
                     debug_counters["slots_pulados"].append(f"Sem lição: {disc_name} #{pedagogical_idx}")
                     if output_dir == 'prontas':
+                        _descarta('sem_licao_prontas')
                         continue
 
                 title = lesson['title'] if lesson else f"{disc_name} - Aula {pedagogical_idx}"
@@ -954,6 +1116,22 @@ def gerar_txt_planos(
                 objetivos_list = parsed.get('objetivos', []) if parsed else []
                 recursos_section = parsed.get('recursos', '') if parsed else ''
                 atividade_section = parsed.get('atividade', '') if parsed else ''
+
+                # IS-045: campos da aula especial vêm do livro-caixa (origem:
+                # plugin Atividades); markdown livre continua funcionando.
+                if especial_lc is not None:
+                    if especial_lc.get('objetivos'):
+                        objetivos_list = list(especial_lc['objetivos'])
+                    if especial_lc.get('recursos'):
+                        recursos_section = str(especial_lc['recursos'])
+                    if especial_lc.get('atividade'):
+                        atividade_section = str(especial_lc['atividade'])
+                    estrategia_plano = (
+                        especial_lc.get('estrategia')
+                        or f"Aula especial — {especial_lc.get('tipo_nome') or 'avaliação'}"
+                    )
+                else:
+                    estrategia_plano = estrategia
 
                 # Limpar nome da disciplina: remover sufixos como "2026A", "(Turma...)"
                 disc_name_clean = re.sub(r'\s*\d{4}[A-Z]\b', '', disc_name)
@@ -973,7 +1151,7 @@ def gerar_txt_planos(
                     'objetivos': objetivos_list,
                     'recursos': clean_text_local(recursos_section, 300) if recursos_section else '',
                     'atividade': clean_text_local(atividade_section, 300) if atividade_section else '',
-                    'estrategia': estrategia or "Aula expositiva e prática.",
+                    'estrategia': estrategia_plano or "Aula expositiva e prática.",
                     'file_suffix': "",
                     'video_url': video_url,
                     'disciplina_nome_display': cfg_alias.get('aliases_name') or re.sub(r'\s*\((?:Prática|Pratica|Teoria|Teórica|Turma.*?)\)', '', re.sub(r'\s*\d{4}[A-Z]\b', '', disc_name), flags=re.IGNORECASE).strip()
@@ -1240,6 +1418,7 @@ def gerar_txt_planos(
         "freq_outra_disciplina": planos_freq_outra_disciplina,
         "updated_db": planos_atualizados_db,
         "sem_licao": debug_counters["sem_licao"],
+        "especiais": debug_counters["especiais"],
         "path": f"aulas/{output_dir}/",
         "files": generated_files,
         "skipped_files": skipped_files,

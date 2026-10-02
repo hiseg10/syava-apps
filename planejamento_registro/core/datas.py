@@ -6,6 +6,10 @@ Regra de início da geração:
   turma/disciplina (considerando aliases base/filha).
 - Sábados letivos: seguem apenas a ``data_corte``.
 - Disciplinas sem histórico começam na ``data_corte``.
+- Fila Disc.Tec. (modulares/mensais): o piso acima é elevado a
+  ``última_aula_modular + 1 dia`` por turma (IS-043) — o portal manda sobre
+  a janela do plano anual e sua tolerância; aplicado no gerador via
+  :func:`ultima_aula_modular`.
 """
 
 from datetime import datetime, timedelta
@@ -96,6 +100,53 @@ def ultima_aula_por_disciplina():
         if k not in out or d > out[k]:
             out[k] = d
     return out
+
+
+def ultima_aula_modular(ids_modulares):
+    """Ids modulares expandidos e última aula modular registrada por turma.
+
+    Retorna ``(ids_expandidos, {turma_str: date})``. É o piso da fila
+    Disc.Tec. aplicado ANTES do calendário anual (IS-043): a disciplina
+    modular seguinte só começa depois da última aula registrada entre as
+    janelas modulares da turma — mesmo que a tolerância (±N dias) da janela
+    ainda permita a data. Os ids são expandidos via ``discipline_aliases``
+    (base <-> aliases) para casar com o ``disciplina_id`` do histórico.
+    """
+    alias_to_base, base_to_aliases = _alias_maps()
+    ids = set()
+    for i in (ids_modulares or []):
+        s = str(i).strip()
+        if not s.isdigit():
+            continue
+        n = int(s)
+        b = alias_to_base.get(n, n)
+        ids.add(str(n))
+        ids.add(str(b))
+        ids.update(str(a) for a in base_to_aliases.get(b, set()))
+    out = {}
+    if not ids:
+        return ids, out
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT turma_id, disciplina_id, data_aula FROM historico_aulas "
+            "WHERE turma_id IS NOT NULL AND disciplina_id IS NOT NULL "
+            "AND data_aula IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    for r in rows:
+        if str(r["disciplina_id"]) not in ids:
+            continue
+        d = parse_data(r["data_aula"])
+        if not d:
+            continue
+        t = str(r["turma_id"])
+        if t not in out or d > out[t]:
+            out[t] = d
+    return ids, out
 
 
 def inicio_geracao(corte, data_inicio):
